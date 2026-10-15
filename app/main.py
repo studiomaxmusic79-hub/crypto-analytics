@@ -311,6 +311,21 @@ def export(
                 f'attachment; filename="krypta-{symbol}.csv"'
         }
     )
+@app.get("/robots.txt", include_in_schema=False)
+def robots():
+    return FileResponse(
+        STATIC / "robots.txt",
+        media_type="text/plain"
+    )
+
+
+@app.get("/sitemap.xml", include_in_schema=False)
+def sitemap():
+    return FileResponse(
+        STATIC / "sitemap.xml",
+        media_type="application/xml"
+    )
+
 
 @app.get("/googlea35b0bd688671f7e.html", include_in_schema=False)
 def google_verification():
