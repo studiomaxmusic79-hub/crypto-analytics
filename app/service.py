@@ -1,12 +1,14 @@
 import asyncio
 import time
+
 from .analytics import analyze, evaluate
 from .market import SYMBOLS, INTERVALS, MarketError
 
 
 class ForecastService:
     def __init__(self, market, store):
-        self.market, self.store = market, store
+        self.market = market
+        self.store = store
         self.last_cycle_at = None
         self.errors = {}
 
@@ -16,33 +18,56 @@ class ForecastService:
         # В базе горизонт хранится целым числом:
         # 30 = 30 минут, 1 = 1 час, 4 = 4 часа.
         missing = [
-            h for h in (30, 1, 4)
+            h
+            for h in (30, 1, 4)
             if not await asyncio.to_thread(
-                self.store.has_slot, symbol, h, slot
+                self.store.has_slot,
+                symbol,
+                h,
+                slot
             )
         ]
 
+        # Если прогнозы для этого 15-минутного
+        # интервала уже есть, Binance не запрашиваем.
         if not missing:
             return
 
-        recent = await self.market.klines(symbol, "1m", limit=3)
-        closed = [c for c in recent if int(c[6]) < now]
+        recent = await self.market.klines(
+            symbol,
+            "1m",
+            limit=3
+        )
+
+        closed = [
+            c
+            for c in recent
+            if int(c[6]) < now
+        ]
 
         if not closed:
-            raise MarketError("Нет закрытой минутной свечи")
+            raise MarketError(
+                "Нет закрытой минутной свечи"
+            )
 
         base = closed[-1]
         reference_at = int(base[6]) + 1
 
         if not 0 <= now - reference_at <= 90_000:
             raise MarketError(
-                "Минутные данные устарели; прогноз не сформирован"
+                "Минутные данные устарели; "
+                "прогноз не сформирован"
             )
 
         for horizon in missing:
-            # 30 минут и 1 час анализируем по 15-минутным свечам.
+            # 30 минут и 1 час анализируем
+            # по 15-минутным свечам.
             # 4 часа — по часовым.
-            interval = "15m" if horizon in (30, 1) else "1h"
+            interval = (
+                "15m"
+                if horizon in (30, 1)
+                else "1h"
+            )
 
             candles = await self.market.klines(
                 symbol,
@@ -52,21 +77,34 @@ class ForecastService:
             )
 
             candles = [
-                c for c in candles
+                c
+                for c in candles
                 if int(c[6]) < reference_at
             ]
+
+            expected_close = (
+                reference_at
+                // INTERVALS[interval]
+                * INTERVALS[interval]
+            )
 
             if (
                 not candles
                 or int(candles[-1][6]) + 1
-                != reference_at // INTERVALS[interval] * INTERVALS[interval]
+                != expected_close
             ):
                 raise MarketError(
                     "Последняя закрытая свеча отсутствует"
                 )
 
-            prediction = analyze(candles, horizon)
-            issued_at = int(time.time() * 1000)
+            prediction = analyze(
+                candles,
+                horizon
+            )
+
+            issued_at = int(
+                time.time() * 1000
+            )
 
             if (
                 abs(issued_at - now) > 60_000
@@ -74,13 +112,20 @@ class ForecastService:
             ):
                 raise MarketError(
                     "Данные устарели при расчёте "
-                    "или часы сервера не синхронизированы"
+                    "или часы сервера "
+                    "не синхронизированы"
                 )
 
             if horizon == 30:
-                due_at = reference_at + 30 * 60_000
+                due_at = (
+                    reference_at
+                    + 30 * 60_000
+                )
             else:
-                due_at = reference_at + horizon * 3_600_000
+                due_at = (
+                    reference_at
+                    + horizon * 3_600_000
+                )
 
             await asyncio.to_thread(
                 self.store.save,
@@ -146,24 +191,44 @@ class ForecastService:
                 break
 
     async def cycle(self):
+        # Получаем время Binance один раз
+        # и используем его для всего цикла.
         now = await self.market.time_ms()
-        self.errors.pop("connection", None)
+
+        self.errors.pop(
+            "connection",
+            None
+        )
 
         for symbol in SYMBOLS:
             try:
-                await self.generate(symbol, now)
-                self.errors.pop(symbol, None)
+                await self.generate(
+                    symbol,
+                    now
+                )
 
-            except (MarketError, ValueError) as exc:
+                self.errors.pop(
+                    symbol,
+                    None
+                )
+
+            except (
+                MarketError,
+                ValueError
+            ) as exc:
                 self.errors[symbol] = str(exc)
 
-        self.errors.pop("evaluation", None)
-
-        await self.settle(
-            await self.market.time_ms()
+        self.errors.pop(
+            "evaluation",
+            None
         )
 
-        self.last_cycle_at = int(time.time() * 1000)
+        # Второй запрос времени Binance больше не нужен.
+        await self.settle(now)
+
+        self.last_cycle_at = int(
+            time.time() * 1000
+        )
 
     async def run(self):
         while True:
@@ -183,4 +248,6 @@ class ForecastService:
                     "и журнал сервера."
                 )
 
-            await asyncio.sleep(30)
+            # Раньше цикл запускался каждые 30 секунд.
+            # Для прогнозов раз в 15 минут это избыточно.
+            await asyncio.sleep(120)
