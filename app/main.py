@@ -312,7 +312,13 @@ def export(
         }
     )
 
-
+@app.get("/googlea35b0bd688671f7e.html", include_in_schema=False)
+def google_verification():
+    return FileResponse(
+        Path("googlea35b0bd688671f7e.html"),
+        media_type="text/html"
+    )
+    
 @app.get("/", include_in_schema=False)
 def index():
     return FileResponse(
