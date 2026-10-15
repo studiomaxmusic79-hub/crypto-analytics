@@ -1,7 +1,9 @@
 import asyncio
 import math
 import time
+
 import httpx
+
 
 INTERVALS = {
     "1m": 60_000,
@@ -12,6 +14,7 @@ INTERVALS = {
 
 BASE_URL = "https://data-api.binance.vision"
 SYMBOLS = ("BTCUSDT", "ETHUSDT")
+
 
 class MarketError(Exception):
     pass
@@ -33,11 +36,15 @@ class BinanceMarket:
         await self.client.aclose()
 
     async def get(self, path, params=None, ttl=0):
-        # Только публичные рыночные данные Binance. API-ключи не используются.
+        # Только публичные рыночные данные Binance.
+        # API-ключи не используются.
         if path not in ("time", "ticker/24hr", "klines"):
             raise ValueError("Endpoint not allowed")
 
-        key = (path, tuple(sorted((params or {}).items())))
+        key = (
+            path,
+            tuple(sorted((params or {}).items()))
+        )
 
         async with self.lock:
             cached = self.cache.get(key)
@@ -47,7 +54,8 @@ class BinanceMarket:
 
             if time.monotonic() < self.cooldown_until:
                 raise MarketError(
-                    "Binance ограничил частоту запросов. Повторим позже."
+                    "Binance ограничил частоту запросов. "
+                    "Повторим позже."
                 )
 
             async with self.semaphore:
@@ -63,16 +71,24 @@ class BinanceMarket:
                                 60,
                                 min(
                                     86400,
-                                    int(response.headers.get("Retry-After", "60"))
+                                    int(
+                                        response.headers.get(
+                                            "Retry-After",
+                                            "60"
+                                        )
+                                    )
                                 )
                             )
                         except ValueError:
                             delay = 60
 
-                        self.cooldown_until = time.monotonic() + delay
+                        self.cooldown_until = (
+                            time.monotonic() + delay
+                        )
 
                         raise MarketError(
-                            "Binance ограничил частоту запросов. Повторим позже."
+                            "Binance ограничил частоту запросов. "
+                            "Повторим позже."
                         )
 
                     response.raise_for_status()
@@ -88,12 +104,18 @@ class BinanceMarket:
                 if len(self.cache) > 64:
                     self.cache.clear()
 
-                self.cache[key] = (time.monotonic(), data)
+                self.cache[key] = (
+                    time.monotonic(),
+                    data
+                )
 
             return data
 
     async def time_ms(self):
-    data = await self.get("time", ttl=60)
+        data = await self.get(
+            "time",
+            ttl=60
+        )
 
         try:
             return int(data["serverTime"])
@@ -109,14 +131,16 @@ class BinanceMarket:
         data = await self.get(
             "ticker/24hr",
             {"symbol": symbol},
-            ttl=15
+            ttl=60
         )
 
         try:
             result = {
                 "symbol": symbol,
                 "price": float(data["lastPrice"]),
-                "change_pct": float(data["priceChangePercent"]),
+                "change_pct": float(
+                    data["priceChangePercent"]
+                ),
                 "high": float(data["highPrice"]),
                 "low": float(data["lowPrice"]),
                 "volume": float(data["quoteVolume"]),
@@ -125,7 +149,13 @@ class BinanceMarket:
 
             if any(
                 not math.isfinite(result[k])
-                for k in ("price", "change_pct", "high", "low", "volume")
+                for k in (
+                    "price",
+                    "change_pct",
+                    "high",
+                    "low",
+                    "volume"
+                )
             ):
                 raise ValueError("Invalid quote")
 
@@ -133,7 +163,8 @@ class BinanceMarket:
                 raise ValueError("Invalid quote")
 
             if abs(
-                int(time.time() * 1000) - result["updated_at"]
+                int(time.time() * 1000)
+                - result["updated_at"]
             ) > 120_000:
                 raise MarketError(
                     "Binance вернул устаревшую котировку"
@@ -146,11 +177,22 @@ class BinanceMarket:
                 "Некорректная котировка Binance"
             ) from exc
 
-    async def klines(self, symbol, interval, limit=200, **params):
+    async def klines(
+        self,
+        symbol,
+        interval,
+        limit=200,
+        **params
+    ):
         symbol = symbol.upper().strip()
 
-        if interval not in INTERVALS or not 1 <= limit <= 1000:
-            raise ValueError("Invalid market parameters")
+        if (
+            interval not in INTERVALS
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError(
+                "Invalid market parameters"
+            )
 
         data = await self.get(
             "klines",
@@ -173,33 +215,56 @@ class BinanceMarket:
                 start = int(row[0])
                 end = int(row[6])
 
-                o, h, l, c, v = map(float, row[1:6])
+                o, h, l, c, v = map(
+                    float,
+                    row[1:6]
+                )
 
                 if (
                     start <= previous
                     or start % INTERVALS[interval]
-                    or end != start + INTERVALS[interval] - 1
+                    or end
+                    != start
+                    + INTERVALS[interval]
+                    - 1
                     or any(
                         not math.isfinite(x)
-                        for x in (o, h, l, c, v)
+                        for x in (
+                            o,
+                            h,
+                            l,
+                            c,
+                            v
+                        )
                     )
                     or min(o, h, l, c) <= 0
                     or v < 0
                     or h < max(o, c, l)
                     or l > min(o, c, h)
                 ):
-                    raise ValueError("Invalid candle")
+                    raise ValueError(
+                        "Invalid candle"
+                    )
 
                 previous = start
 
             return data
 
-        except (ValueError, TypeError, IndexError) as exc:
+        except (
+            ValueError,
+            TypeError,
+            IndexError
+        ) as exc:
             raise MarketError(
                 "Некорректные свечи Binance"
             ) from exc
 
-    async def target_price(self, symbol, due_at, now):
+    async def target_price(
+        self,
+        symbol,
+        due_at,
+        now
+    ):
         if due_at > now:
             return None
 
@@ -213,8 +278,10 @@ class BinanceMarket:
 
         if (
             not candles
-            or int(candles[0][0]) != due_at - 60_000
-            or int(candles[0][6]) != due_at - 1
+            or int(candles[0][0])
+            != due_at - 60_000
+            or int(candles[0][6])
+            != due_at - 1
         ):
             return None
 
