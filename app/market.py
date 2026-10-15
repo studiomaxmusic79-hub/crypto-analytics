@@ -13,7 +13,6 @@ INTERVALS = {
 }
 
 BASE_URL = "https://data-api.binance.vision"
-SYMBOLS = ("BTCUSDT", "ETHUSDT")
 
 
 class MarketError(Exception):
@@ -37,14 +36,24 @@ class BinanceMarket:
         await self.client.aclose()
 
     async def get(self, path, params=None, ttl=0):
-        # Только публичные рыночные данные Binance.
+        # Только публичные данные Binance.
         # API-ключи не используются.
-        if path not in ("time", "ticker/24hr", "klines"):
-            raise ValueError("Endpoint not allowed")
+        if path not in (
+            "time",
+            "ticker/24hr",
+            "klines"
+        ):
+            raise ValueError(
+                "Endpoint not allowed"
+            )
 
         key = (
             path,
-            tuple(sorted((params or {}).items()))
+            tuple(
+                sorted(
+                    (params or {}).items()
+                )
+            )
         )
 
         async with self.lock:
@@ -57,9 +66,17 @@ class BinanceMarket:
                 return cached[1]
 
             if time.monotonic() < self.cooldown_until:
+                remaining = max(
+                    1,
+                    int(
+                        self.cooldown_until
+                        - time.monotonic()
+                    )
+                )
+
                 raise MarketError(
-                    "Binance ограничил частоту запросов. "
-                    "Повторим позже."
+                    "Binance cooldown активен. "
+                    f"Осталось примерно {remaining} сек."
                 )
 
             async with self.semaphore:
@@ -69,40 +86,118 @@ class BinanceMarket:
                         params=params
                     )
 
-                    if response.status_code in (418, 429):
-                        try:
-                            delay = max(
-                                60,
-                                min(
-                                    86400,
-                                    int(
-                                        response.headers.get(
-                                            "Retry-After",
-                                            "60"
-                                        )
-                                    )
-                                )
-                            )
-                        except ValueError:
-                            delay = 60
-
-                        self.cooldown_until = (
-                            time.monotonic() + delay
-                        )
-
-                        raise MarketError(
-                            "Binance ограничил частоту запросов. "
-                            "Повторим позже."
-                        )
-
-                    response.raise_for_status()
-                    data = response.json()
-
-                except (httpx.HTTPError, ValueError) as exc:
+                except httpx.HTTPError as exc:
                     raise MarketError(
-                        "Нет доступа к публичным данным Binance. "
-                        "Проверьте сеть или регион сервера."
+                        "Ошибка соединения с Binance: "
+                        f"{type(exc).__name__}"
                     ) from exc
+
+            status = response.status_code
+
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
+
+            used_weight = response.headers.get(
+                "X-MBX-USED-WEIGHT-1M"
+            )
+
+            try:
+                payload = response.json()
+
+            except ValueError:
+                payload = None
+
+            if isinstance(payload, dict):
+                binance_code = payload.get("code")
+                binance_msg = payload.get("msg")
+            else:
+                binance_code = None
+                binance_msg = None
+
+            # Показываем настоящий ответ Binance,
+            # чтобы можно было установить причину.
+            if status in (418, 429):
+                try:
+                    delay = int(
+                        retry_after or "60"
+                    )
+                except ValueError:
+                    delay = 60
+
+                delay = max(
+                    60,
+                    min(
+                        86400,
+                        delay
+                    )
+                )
+
+                self.cooldown_until = (
+                    time.monotonic() + delay
+                )
+
+                details = [
+                    f"HTTP {status}"
+                ]
+
+                if binance_code is not None:
+                    details.append(
+                        f"code={binance_code}"
+                    )
+
+                if binance_msg:
+                    details.append(
+                        f"msg={binance_msg}"
+                    )
+
+                if retry_after:
+                    details.append(
+                        f"Retry-After={retry_after}"
+                    )
+
+                if used_weight:
+                    details.append(
+                        f"weight={used_weight}"
+                    )
+
+                raise MarketError(
+                    "Binance rate limit: "
+                    + " | ".join(details)
+                )
+
+            if status >= 400:
+                details = [
+                    f"HTTP {status}"
+                ]
+
+                if binance_code is not None:
+                    details.append(
+                        f"code={binance_code}"
+                    )
+
+                if binance_msg:
+                    details.append(
+                        f"msg={binance_msg}"
+                    )
+
+                if used_weight:
+                    details.append(
+                        f"weight={used_weight}"
+                    )
+
+                raise MarketError(
+                    "Binance вернул ошибку: "
+                    + " | ".join(details)
+                )
+
+            if payload is None:
+                raise MarketError(
+                    "Binance вернул ответ "
+                    "в неизвестном формате"
+                )
+
+            data = payload
 
             if ttl:
                 if len(self.cache) > 64:
@@ -122,7 +217,9 @@ class BinanceMarket:
         )
 
         try:
-            return int(data["serverTime"])
+            return int(
+                data["serverTime"]
+            )
 
         except (
             KeyError,
@@ -134,7 +231,11 @@ class BinanceMarket:
             ) from exc
 
     async def ticker(self, symbol):
-        symbol = symbol.upper().strip()
+        symbol = (
+            symbol
+            .upper()
+            .strip()
+        )
 
         data = await self.get(
             "ticker/24hr",
@@ -146,29 +247,46 @@ class BinanceMarket:
 
         try:
             result = {
-                "symbol": symbol,
-                "price": float(
-                    data["lastPrice"]
-                ),
-                "change_pct": float(
-                    data["priceChangePercent"]
-                ),
-                "high": float(
-                    data["highPrice"]
-                ),
-                "low": float(
-                    data["lowPrice"]
-                ),
-                "volume": float(
-                    data["quoteVolume"]
-                ),
-                "updated_at": int(
-                    data["closeTime"]
-                ),
+                "symbol":
+                    symbol,
+
+                "price":
+                    float(
+                        data["lastPrice"]
+                    ),
+
+                "change_pct":
+                    float(
+                        data[
+                            "priceChangePercent"
+                        ]
+                    ),
+
+                "high":
+                    float(
+                        data["highPrice"]
+                    ),
+
+                "low":
+                    float(
+                        data["lowPrice"]
+                    ),
+
+                "volume":
+                    float(
+                        data["quoteVolume"]
+                    ),
+
+                "updated_at":
+                    int(
+                        data["closeTime"]
+                    ),
             }
 
             if any(
-                not math.isfinite(result[k])
+                not math.isfinite(
+                    result[k]
+                )
                 for k in (
                     "price",
                     "change_pct",
@@ -191,7 +309,8 @@ class BinanceMarket:
                 - result["updated_at"]
             ) > 120_000:
                 raise MarketError(
-                    "Binance вернул устаревшую котировку"
+                    "Binance вернул "
+                    "устаревшую котировку"
                 )
 
             return result
@@ -212,7 +331,11 @@ class BinanceMarket:
         limit=200,
         **params
     ):
-        symbol = symbol.upper().strip()
+        symbol = (
+            symbol
+            .upper()
+            .strip()
+        )
 
         if (
             interval not in INTERVALS
@@ -222,8 +345,8 @@ class BinanceMarket:
                 "Invalid market parameters"
             )
 
-        # Обычные свечи графика кэшируем на 60 секунд.
-        # Исторические запросы с дополнительными параметрами
+        # Обычные свечи кэшируются.
+        # Исторические запросы пока
         # оставляем без кэша.
         data = await self.get(
             "klines",
@@ -237,7 +360,10 @@ class BinanceMarket:
         )
 
         try:
-            if not isinstance(data, list):
+            if not isinstance(
+                data,
+                list
+            ):
                 raise ValueError(
                     "Not a list"
                 )
@@ -245,8 +371,13 @@ class BinanceMarket:
             previous = -1
 
             for row in data:
-                start = int(row[0])
-                end = int(row[6])
+                start = int(
+                    row[0]
+                )
+
+                end = int(
+                    row[6]
+                )
 
                 o, h, l, c, v = map(
                     float,
@@ -255,7 +386,8 @@ class BinanceMarket:
 
                 if (
                     start <= previous
-                    or start % INTERVALS[interval]
+                    or start
+                    % INTERVALS[interval]
                     or end
                     != start
                     + INTERVALS[interval]
@@ -270,10 +402,23 @@ class BinanceMarket:
                             v
                         )
                     )
-                    or min(o, h, l, c) <= 0
+                    or min(
+                        o,
+                        h,
+                        l,
+                        c
+                    ) <= 0
                     or v < 0
-                    or h < max(o, c, l)
-                    or l > min(o, c, h)
+                    or h < max(
+                        o,
+                        c,
+                        l
+                    )
+                    or l > min(
+                        o,
+                        c,
+                        h
+                    )
                 ):
                     raise ValueError(
                         "Invalid candle"
@@ -305,16 +450,22 @@ class BinanceMarket:
             symbol,
             "1m",
             limit=1,
-            startTime=due_at - 60_000,
-            endTime=due_at - 1
+            startTime=(
+                due_at - 60_000
+            ),
+            endTime=(
+                due_at - 1
+            )
         )
 
         if (
             not candles
-            or int(candles[0][0])
-            != due_at - 60_000
-            or int(candles[0][6])
-            != due_at - 1
+            or int(
+                candles[0][0]
+            ) != due_at - 60_000
+            or int(
+                candles[0][6]
+            ) != due_at - 1
         ):
             return None
 
