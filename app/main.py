@@ -24,26 +24,72 @@ STATIC = Path(__file__).parent / "static"
 Symbol = str
 
 
+def normalize_symbol(symbol: str) -> str:
+    symbol = (
+        symbol
+        .upper()
+        .strip()
+        .replace("/", "")
+        .replace("-", "")
+        .replace(" ", "")
+    )
+
+    if not symbol.endswith("USDT"):
+        raise HTTPException(
+            400,
+            "Поддерживаются пары к USDT"
+        )
+
+    if len(symbol) <= 4:
+        raise HTTPException(
+            400,
+            "Некорректная валютная пара"
+        )
+
+    return symbol
+
+
+def activate_symbol(
+    request: Request,
+    symbol: str
+) -> str:
+    symbol = normalize_symbol(symbol)
+
+    request.app.state.service.set_active_symbol(
+        symbol
+    )
+
+    return symbol
+
+
 @asynccontextmanager
 async def lifespan(app):
     store = Store()
     await asyncio.to_thread(store.init)
 
     market = BinanceMarket()
-    service = ForecastService(market, store)
+    service = ForecastService(
+        market,
+        store
+    )
 
     app.state.store = store
     app.state.market = market
     app.state.service = service
 
-    task = asyncio.create_task(service.run())
+    task = asyncio.create_task(
+        service.run()
+    )
 
     try:
         yield
+
     finally:
         task.cancel()
 
-        with suppress(asyncio.CancelledError):
+        with suppress(
+            asyncio.CancelledError
+        ):
             await task
 
         await market.close()
@@ -60,13 +106,29 @@ app = FastAPI(
 
 
 @app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+async def security_headers(
+    request: Request,
+    call_next
+):
+    response = await call_next(
+        request
+    )
 
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Content-Security-Policy"] = (
+    response.headers[
+        "X-Content-Type-Options"
+    ] = "nosniff"
+
+    response.headers[
+        "Referrer-Policy"
+    ] = "same-origin"
+
+    response.headers[
+        "X-Frame-Options"
+    ] = "DENY"
+
+    response.headers[
+        "Content-Security-Policy"
+    ] = (
         "default-src 'self'; "
         "script-src 'self'; "
         "style-src 'self'; "
@@ -76,14 +138,21 @@ async def security_headers(request: Request, call_next):
         "base-uri 'self'"
     )
 
-    if request.url.path.startswith("/api/"):
-        response.headers["Cache-Control"] = "no-store"
+    if request.url.path.startswith(
+        "/api/"
+    ):
+        response.headers[
+            "Cache-Control"
+        ] = "no-store"
 
     return response
 
 
 @app.exception_handler(MarketError)
-async def market_exception(request, exc):
+async def market_exception(
+    request,
+    exc
+):
     return JSONResponse(
         status_code=503,
         content={
@@ -93,7 +162,10 @@ async def market_exception(request, exc):
 
 
 @app.exception_handler(Exception)
-async def server_exception(request, exc):
+async def server_exception(
+    request,
+    exc
+):
     return JSONResponse(
         status_code=503,
         content={
@@ -105,7 +177,9 @@ async def server_exception(request, exc):
 
 
 @app.get("/healthz")
-def health(request: Request):
+def health(
+    request: Request
+):
     try:
         request.app.state.store.ready()
 
@@ -121,19 +195,42 @@ def health(request: Request):
 
 
 @app.get("/api/status")
-def status(request: Request):
+def status(
+    request: Request
+):
     service = request.app.state.service
 
     return {
-        "now": int(time.time() * 1000),
-        "last_cycle_at": service.last_cycle_at,
-        "errors": dict(service.errors),
+        "now":
+            int(time.time() * 1000),
+
+        "last_cycle_at":
+            service.last_cycle_at,
+
+        "active_symbol":
+            service.active_symbol,
+
+        "errors":
+            dict(service.errors),
+
         "storage":
-            request.app.state.store.engine.dialect.name,
-        "render_free": bool(os.getenv("RENDER")),
-        "source": "Binance public market data",
-        "generation_interval_minutes": 15,
-        "calibrated_probability": False
+            request.app.state
+            .store
+            .engine
+            .dialect
+            .name,
+
+        "render_free":
+            bool(os.getenv("RENDER")),
+
+        "source":
+            "Binance public market data",
+
+        "generation_interval_minutes":
+            15,
+
+        "calibrated_probability":
+            False
     }
 
 
@@ -141,12 +238,27 @@ def status(request: Request):
 async def market(
     request: Request,
     symbol: Symbol = "BTCUSDT",
-    interval: Literal["15m", "1h", "4h"] = "1h"
+    interval: Literal[
+        "15m",
+        "1h",
+        "4h"
+    ] = "1h"
 ):
+    # Выбранная пользователем монета
+    # становится активной для фонового
+    # расчёта прогнозов.
+    symbol = activate_symbol(
+        request,
+        symbol
+    )
+
     market = request.app.state.market
 
-    # Эти данные уже кэшируются в market.py.
-    ticker = await market.ticker(symbol)
+    # Эти данные кэшируются
+    # в market.py.
+    ticker = await market.ticker(
+        symbol
+    )
 
     candles = await market.klines(
         symbol,
@@ -156,7 +268,8 @@ async def market(
 
     if not candles:
         raise MarketError(
-            "Binance не вернул свечи для графика. "
+            "Binance не вернул свечи "
+            "для графика. "
             "Повторим запрос позже."
         )
 
@@ -184,11 +297,16 @@ async def quote(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
-    # ticker() кэшируется в market.py,
-    # поэтому частые обращения браузера
-    # не должны каждый раз идти в Binance.
-    return await request.app.state.market.ticker(
+    symbol = normalize_symbol(
         symbol
+    )
+
+    # Только цена выбранной валюты.
+    # ticker() кэшируется в market.py.
+    return await (
+        request.app.state
+        .market
+        .ticker(symbol)
     )
 
 
@@ -197,17 +315,19 @@ def forecasts(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
-    symbol = symbol.upper().strip()
+    symbol = activate_symbol(
+        request,
+        symbol
+    )
 
-    # ВАЖНО:
-    # Здесь больше нет обращения к Binance.
-    # Прогнозы создаёт ForecastService
-    # в фоновом режиме.
-    # Браузер только читает готовые данные
-    # из базы.
+    # Здесь Binance не вызывается.
+    # Браузер читает уже готовые
+    # прогнозы из базы.
     return {
         "items":
-            request.app.state.store.latest(symbol)
+            request.app.state
+            .store
+            .latest(symbol)
     }
 
 
@@ -215,7 +335,12 @@ def forecasts(
 def history(
     request: Request,
     symbol: Symbol = "BTCUSDT",
-    horizon: Literal["0", "30", "1", "4"] = "0",
+    horizon: Literal[
+        "0",
+        "30",
+        "1",
+        "4"
+    ] = "0",
     offset: int = Query(
         0,
         ge=0,
@@ -227,11 +352,19 @@ def history(
         le=100
     )
 ):
-    return request.app.state.store.history(
-        symbol,
-        int(horizon),
-        offset,
-        limit
+    symbol = normalize_symbol(
+        symbol
+    )
+
+    return (
+        request.app.state
+        .store
+        .history(
+            symbol,
+            int(horizon),
+            offset,
+            limit
+        )
     )
 
 
@@ -240,9 +373,15 @@ def stats(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
+    symbol = normalize_symbol(
+        symbol
+    )
+
     return {
         "items":
-            request.app.state.store.stats(symbol)
+            request.app.state
+            .store
+            .stats(symbol)
     }
 
 
@@ -251,6 +390,10 @@ def export(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
+    symbol = normalize_symbol(
+        symbol
+    )
+
     store = request.app.state.store
 
     def generate():
@@ -286,16 +429,22 @@ def export(
 
         writer.writeheader()
 
-        yield "\ufeff" + output.getvalue()
+        yield (
+            "\ufeff" +
+            output.getvalue()
+        )
 
         from sqlalchemy import select
-        from .storage import forecasts as table
+        from .storage import (
+            forecasts as table
+        )
 
         with store.engine.connect() as conn:
             max_id = conn.execute(
                 select(table.c.id)
                 .where(
-                    table.c.symbol == symbol
+                    table.c.symbol ==
+                    symbol
                 )
                 .order_by(
                     table.c.id.desc()
@@ -311,11 +460,18 @@ def export(
                 rows = conn.execute(
                     select(table)
                     .where(
-                        table.c.symbol == symbol,
-                        table.c.id > cursor,
-                        table.c.id <= max_id
+                        table.c.symbol ==
+                        symbol,
+
+                        table.c.id >
+                        cursor,
+
+                        table.c.id <=
+                        max_id
                     )
-                    .order_by(table.c.id)
+                    .order_by(
+                        table.c.id
+                    )
                     .limit(500)
                 ).all()
 
@@ -331,17 +487,21 @@ def export(
                 )
 
             cursor = (
-                rows[-1]._mapping["id"]
+                rows[-1]
+                ._mapping["id"]
             )
 
             yield output.getvalue()
 
     return StreamingResponse(
         generate(),
-        media_type="text/csv; charset=utf-8",
+        media_type=(
+            "text/csv; charset=utf-8"
+        ),
         headers={
             "Content-Disposition":
-                f'attachment; filename="krypta-{symbol}.csv"'
+                f'attachment; '
+                f'filename="krypta-{symbol}.csv"'
         }
     )
 
@@ -354,7 +514,8 @@ def index_en():
     return FileResponse(
         STATIC / "index-en.html",
         headers={
-            "Cache-Control": "no-cache"
+            "Cache-Control":
+                "no-cache"
         }
     )
 
@@ -402,13 +563,16 @@ def index():
     return FileResponse(
         STATIC / "index.html",
         headers={
-            "Cache-Control": "no-cache"
+            "Cache-Control":
+                "no-cache"
         }
     )
 
 
 app.mount(
     "/static",
-    StaticFiles(directory=STATIC),
+    StaticFiles(
+        directory=STATIC
+    ),
     name="static"
 )
