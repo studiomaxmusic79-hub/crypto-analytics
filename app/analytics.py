@@ -26,11 +26,11 @@ def rsi(values, period=14):
 
 
 def analyze(candles, horizon):
-    if horizon not in (1, 4) or len(candles) < MIN_BARS:
+    if horizon not in (0.5, 1, 4) or len(candles) < MIN_BARS:
         raise ValueError("Недостаточно закрытых свечей для анализа")
     # Fixed rolling window gives reproducible scores regardless of request limit.
     candles = candles[-MIN_BARS:]
-    interval = 900_000 if horizon == 1 else 3_600_000
+    interval = 900_000 if horizon in (0.5, 1) else 3_600_000
     if any(b[0] - a[0] != interval for a, b in zip(candles, candles[1:])):
         raise ValueError("Пропуск свечей: прогноз не сформирован")
     closes = [float(c[4]) for c in candles]
@@ -45,9 +45,10 @@ def analyze(candles, horizon):
     impulse = math.tanh(momentum / max(atr_pct, 0.001))
     oscillator = max(-1.0, min(1.0, (strength - 50) / 25))
     score = 0.5 * trend + 0.3 * impulse + 0.2 * oscillator
-    # Both horizons span 4 bars: 4x15m and 4x1h.
-    move_proxy = score * atr_pct * math.sqrt(4)
-    neutral_pct = max(0.12, 0.25 * atr_pct * math.sqrt(4))
+    # 30m spans 2x15m; 1h spans 4x15m; 4h spans 4x1h.
+    bars_ahead = 2 if horizon == 0.5 else 4
+    move_proxy = score * atr_pct * math.sqrt(bars_ahead)
+    neutral_pct = max(0.12, 0.25 * atr_pct * math.sqrt(bars_ahead))
     direction = "WAIT" if abs(score) < 0.25 or abs(move_proxy) <= neutral_pct else ("UP" if score > 0 else "DOWN")
     return {
         "direction": direction, "confidence": round(abs(score) * 100),
