@@ -311,6 +311,14 @@ def export(
                 f'attachment; filename="krypta-{symbol}.csv"'
         }
     )
+
+@app.get("/en/", include_in_schema=False)
+def index_en():
+    return FileResponse(
+        STATIC / "index-en.html",
+        headers={"Cache-Control": "no-cache"}
+    )
+    
 @app.get("/robots.txt", include_in_schema=False)
 def robots():
     return FileResponse(
