@@ -27,6 +27,7 @@ class BinanceMarket:
             timeout=12,
             follow_redirects=False
         )
+
         self.cache = {}
         self.lock = asyncio.Lock()
         self.semaphore = asyncio.Semaphore(3)
@@ -49,7 +50,10 @@ class BinanceMarket:
         async with self.lock:
             cached = self.cache.get(key)
 
-            if cached and time.monotonic() - cached[0] < ttl:
+            if (
+                cached
+                and time.monotonic() - cached[0] < ttl
+            ):
                 return cached[1]
 
             if time.monotonic() < self.cooldown_until:
@@ -120,7 +124,11 @@ class BinanceMarket:
         try:
             return int(data["serverTime"])
 
-        except (KeyError, TypeError, ValueError) as exc:
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ) as exc:
             raise MarketError(
                 "Некорректное время Binance"
             ) from exc
@@ -130,21 +138,33 @@ class BinanceMarket:
 
         data = await self.get(
             "ticker/24hr",
-            {"symbol": symbol},
+            {
+                "symbol": symbol
+            },
             ttl=60
         )
 
         try:
             result = {
                 "symbol": symbol,
-                "price": float(data["lastPrice"]),
+                "price": float(
+                    data["lastPrice"]
+                ),
                 "change_pct": float(
                     data["priceChangePercent"]
                 ),
-                "high": float(data["highPrice"]),
-                "low": float(data["lowPrice"]),
-                "volume": float(data["quoteVolume"]),
-                "updated_at": int(data["closeTime"]),
+                "high": float(
+                    data["highPrice"]
+                ),
+                "low": float(
+                    data["lowPrice"]
+                ),
+                "volume": float(
+                    data["quoteVolume"]
+                ),
+                "updated_at": int(
+                    data["closeTime"]
+                ),
             }
 
             if any(
@@ -157,10 +177,14 @@ class BinanceMarket:
                     "volume"
                 )
             ):
-                raise ValueError("Invalid quote")
+                raise ValueError(
+                    "Invalid quote"
+                )
 
             if result["price"] <= 0:
-                raise ValueError("Invalid quote")
+                raise ValueError(
+                    "Invalid quote"
+                )
 
             if abs(
                 int(time.time() * 1000)
@@ -172,7 +196,11 @@ class BinanceMarket:
 
             return result
 
-        except (KeyError, TypeError, ValueError) as exc:
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ) as exc:
             raise MarketError(
                 "Некорректная котировка Binance"
             ) from exc
@@ -194,6 +222,9 @@ class BinanceMarket:
                 "Invalid market parameters"
             )
 
+        # Обычные свечи графика кэшируем на 60 секунд.
+        # Исторические запросы с дополнительными параметрами
+        # оставляем без кэша.
         data = await self.get(
             "klines",
             {
@@ -202,12 +233,14 @@ class BinanceMarket:
                 "limit": limit,
                 **params,
             },
-            ttl=20 if not params else 0
+            ttl=60 if not params else 0
         )
 
         try:
             if not isinstance(data, list):
-                raise ValueError("Not a list")
+                raise ValueError(
+                    "Not a list"
+                )
 
             previous = -1
 
@@ -285,4 +318,6 @@ class BinanceMarket:
         ):
             return None
 
-        return float(candles[0][4])
+        return float(
+            candles[0][4]
+        )
