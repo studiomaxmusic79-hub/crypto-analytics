@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from .market import BinanceMarket, MarketError
@@ -82,7 +86,9 @@ async def security_headers(request: Request, call_next):
 async def market_exception(request, exc):
     return JSONResponse(
         status_code=503,
-        content={"detail": str(exc)}
+        content={
+            "detail": str(exc)
+        }
     )
 
 
@@ -91,7 +97,9 @@ async def server_exception(request, exc):
     return JSONResponse(
         status_code=503,
         content={
-            "detail": "Сервис временно недоступен. Повторите запрос позже."
+            "detail":
+                "Сервис временно недоступен. "
+                "Повторите запрос позже."
         }
     )
 
@@ -100,13 +108,16 @@ async def server_exception(request, exc):
 def health(request: Request):
     try:
         request.app.state.store.ready()
+
     except Exception:
         raise HTTPException(
             503,
             "Database unavailable"
         ) from None
 
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
 
 
 @app.get("/api/status")
@@ -117,7 +128,8 @@ def status(request: Request):
         "now": int(time.time() * 1000),
         "last_cycle_at": service.last_cycle_at,
         "errors": dict(service.errors),
-        "storage": request.app.state.store.engine.dialect.name,
+        "storage":
+            request.app.state.store.engine.dialect.name,
         "render_free": bool(os.getenv("RENDER")),
         "source": "Binance public market data",
         "generation_interval_minutes": 15,
@@ -133,6 +145,7 @@ async def market(
 ):
     market = request.app.state.market
 
+    # Эти данные уже кэшируются в market.py.
     ticker = await market.ticker(symbol)
 
     candles = await market.klines(
@@ -171,25 +184,30 @@ async def quote(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
-    return await request.app.state.market.ticker(symbol)
+    # ticker() кэшируется в market.py,
+    # поэтому частые обращения браузера
+    # не должны каждый раз идти в Binance.
+    return await request.app.state.market.ticker(
+        symbol
+    )
 
 
 @app.get("/api/forecasts")
-async def forecasts(
+def forecasts(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
     symbol = symbol.upper().strip()
 
-    now = await request.app.state.market.time_ms()
-
-    await request.app.state.service.generate(
-        symbol,
-        now
-    )
-
+    # ВАЖНО:
+    # Здесь больше нет обращения к Binance.
+    # Прогнозы создаёт ForecastService
+    # в фоновом режиме.
+    # Браузер только читает готовые данные
+    # из базы.
     return {
-        "items": request.app.state.store.latest(symbol)
+        "items":
+            request.app.state.store.latest(symbol)
     }
 
 
@@ -198,8 +216,16 @@ def history(
     request: Request,
     symbol: Symbol = "BTCUSDT",
     horizon: Literal["0", "30", "1", "4"] = "0",
-    offset: int = Query(0, ge=0, le=1_000_000),
-    limit: int = Query(20, ge=1, le=100)
+    offset: int = Query(
+        0,
+        ge=0,
+        le=1_000_000
+    ),
+    limit: int = Query(
+        20,
+        ge=1,
+        le=100
+    )
 ):
     return request.app.state.store.history(
         symbol,
@@ -215,7 +241,8 @@ def stats(
     symbol: Symbol = "BTCUSDT"
 ):
     return {
-        "items": request.app.state.store.stats(symbol)
+        "items":
+            request.app.state.store.stats(symbol)
     }
 
 
@@ -267,8 +294,12 @@ def export(
         with store.engine.connect() as conn:
             max_id = conn.execute(
                 select(table.c.id)
-                .where(table.c.symbol == symbol)
-                .order_by(table.c.id.desc())
+                .where(
+                    table.c.symbol == symbol
+                )
+                .order_by(
+                    table.c.id.desc()
+                )
                 .limit(1)
             ).scalar()
 
@@ -299,7 +330,9 @@ def export(
                     dict(row._mapping)
                 )
 
-            cursor = rows[-1]._mapping["id"]
+            cursor = (
+                rows[-1]._mapping["id"]
+            )
 
             yield output.getvalue()
 
@@ -312,14 +345,24 @@ def export(
         }
     )
 
-@app.get("/en/", include_in_schema=False)
+
+@app.get(
+    "/en/",
+    include_in_schema=False
+)
 def index_en():
     return FileResponse(
         STATIC / "index-en.html",
-        headers={"Cache-Control": "no-cache"}
+        headers={
+            "Cache-Control": "no-cache"
+        }
     )
-    
-@app.get("/robots.txt", include_in_schema=False)
+
+
+@app.get(
+    "/robots.txt",
+    include_in_schema=False
+)
 def robots():
     return FileResponse(
         STATIC / "robots.txt",
@@ -327,7 +370,10 @@ def robots():
     )
 
 
-@app.get("/sitemap.xml", include_in_schema=False)
+@app.get(
+    "/sitemap.xml",
+    include_in_schema=False
+)
 def sitemap():
     return FileResponse(
         STATIC / "sitemap.xml",
@@ -335,18 +381,29 @@ def sitemap():
     )
 
 
-@app.get("/googlea35b0bd688671f7e.html", include_in_schema=False)
+@app.get(
+    "/googlea35b0bd688671f7e.html",
+    include_in_schema=False
+)
 def google_verification():
     return FileResponse(
-        Path("googlea35b0bd688671f7e.html"),
+        Path(
+            "googlea35b0bd688671f7e.html"
+        ),
         media_type="text/html"
     )
-    
-@app.get("/", include_in_schema=False)
+
+
+@app.get(
+    "/",
+    include_in_schema=False
+)
 def index():
     return FileResponse(
         STATIC / "index.html",
-        headers={"Cache-Control": "no-cache"}
+        headers={
+            "Cache-Control": "no-cache"
+        }
     )
 
 
