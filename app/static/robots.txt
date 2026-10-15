@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://crypto-analytics-zh7n.onrender.com/sitemap.xml
