@@ -93,7 +93,7 @@ class BinanceMarket:
             return data
 
     async def time_ms(self):
-        data = await self.get("time")
+    data = await self.get("time", ttl=60)
 
         try:
             return int(data["serverTime"])
