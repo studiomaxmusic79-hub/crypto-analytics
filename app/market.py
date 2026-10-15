@@ -61,9 +61,6 @@ class BinanceMarket:
             return int(data["serverTime"])
         except (KeyError, TypeError, ValueError) as exc:
             raise MarketError("Некорректное время Binance") from exc
-
-    async def ticker(self, symbol):
-        if symbol not in SYMBOLS:
             raise ValueError("Unknown symbol")
         data = await self.get("ticker/24hr", {"symbol": symbol}, ttl=15)
         try:
