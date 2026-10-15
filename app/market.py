@@ -11,7 +11,7 @@ INTERVALS = {
 }
 
 BASE_URL = "https://data-api.binance.vision"
-
+SYMBOLS = None
 
 class MarketError(Exception):
     pass
