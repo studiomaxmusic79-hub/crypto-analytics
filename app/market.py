@@ -3,7 +3,7 @@ import math
 import time
 import httpx
 
-SYMBOLS = ("BTCUSDT", "ETHUSDT")
+SYMBOLS = None
 INTERVALS = {"1m": 60_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 BASE_URL = "https://data-api.binance.vision"
 
