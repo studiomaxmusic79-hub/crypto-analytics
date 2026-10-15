@@ -73,6 +73,7 @@ async function api(path) {
 
   if (!response.ok) {
     let detail;
+
     try {
       detail = (await response.json()).detail;
     } catch {}
@@ -88,9 +89,14 @@ async function api(path) {
 }
 
 function updateMarketCard(prefix, ticker) {
-  $(prefix + '-price').textContent = '$' + number(ticker.price);
-  $(prefix + '-change').textContent = signed(ticker.change_pct);
-  $(prefix + '-change').className =
+  const price = $(prefix + '-price');
+  const change = $(prefix + '-change');
+
+  if (!price || !change) return;
+
+  price.textContent = '$' + number(ticker.price);
+  change.textContent = signed(ticker.change_pct);
+  change.className =
     'market-change ' +
     (ticker.change_pct >= 0 ? 'positive' : 'negative');
 }
@@ -109,7 +115,9 @@ function updateQuote(ticker) {
     $('main-change').textContent = signed(ticker.change_pct);
     $('main-change').className =
       ticker.change_pct >= 0 ? 'positive' : 'negative';
-    $('updated').textContent = 'Price · ' + timeText(ticker.updated_at);
+
+    $('updated').textContent =
+      'Price · ' + timeText(ticker.updated_at);
   }
 }
 
@@ -119,10 +127,13 @@ function updateSelectedSymbolUI() {
     `<span class="exchange-label">BINANCE</span>`;
 
   $('export').href =
-    '/api/export.csv?symbol=' + encodeURIComponent(state.symbol);
+    '/api/export.csv?symbol=' +
+    encodeURIComponent(state.symbol);
 
   document.querySelectorAll('[data-symbol]').forEach(button => {
-    const selected = button.dataset.symbol === state.symbol;
+    const selected =
+      button.dataset.symbol === state.symbol;
+
     button.classList.toggle('selected', selected);
     button.setAttribute('aria-pressed', selected);
   });
@@ -139,11 +150,14 @@ function renderError() {
   $('connection-dot').className =
     'status-dot ' + (state.marketGood ? 'online' : 'offline');
 
-  $('connection-text').textContent = state.marketGood
-    ? (messages.length
-        ? 'Binance data · some issues'
-        : 'Binance · public data')
-    : 'Data unavailable or loading';
+  $('connection-text').textContent =
+    state.marketGood
+      ? (
+          messages.length
+            ? 'Binance data · some issues'
+            : 'Binance · public data'
+        )
+      : 'Data unavailable or loading';
 }
 
 function renderForecasts(data) {
@@ -153,80 +167,87 @@ function renderForecasts(data) {
       'Waiting for the first calculation.<br>' +
       'No forecast is created when data is unavailable.' +
       '</div>';
+
     return;
   }
 
-  $('forecast-cards').innerHTML = data.items.map(p => {
-    const kind =
-      p.direction === 'UP'
-        ? 'positive'
-        : p.direction === 'DOWN'
-          ? 'negative'
-          : '';
+  $('forecast-cards').innerHTML =
+    data.items.map(p => {
+      const kind =
+        p.direction === 'UP'
+          ? 'positive'
+          : p.direction === 'DOWN'
+            ? 'negative'
+            : '';
 
-    const icon =
-      p.direction === 'UP'
-        ? '↗'
-        : p.direction === 'DOWN'
-          ? '↘'
-          : '→';
+      const icon =
+        p.direction === 'UP'
+          ? '↗'
+          : p.direction === 'DOWN'
+            ? '↘'
+            : '→';
 
-    const label =
-      p.direction === 'UP'
-        ? 'Rise'
-        : p.direction === 'DOWN'
-          ? 'Decline'
-          : 'Watching';
+      const label =
+        p.direction === 'UP'
+          ? 'Rise'
+          : p.direction === 'DOWN'
+            ? 'Decline'
+            : 'Watching';
 
-    const stale = Date.now() - p.issued_at > 17 * 60000;
+      const stale =
+        Date.now() - p.issued_at > 17 * 60000;
 
-    const status =
-      Date.now() >= p.due_at
-        ? 'Archived · horizon completed'
-        : stale
-          ? 'Archived · no new calculation'
-          : `Check at ${timeText(p.due_at)}`;
+      const status =
+        Date.now() >= p.due_at
+          ? 'Archived · horizon completed'
+          : stale
+            ? 'Archived · no new calculation'
+            : `Check at ${timeText(p.due_at)}`;
 
-    const segments = Array.from(
-      {length: 10},
-      (_, i) =>
-        `<i class="${(i + 1) * 10 <= p.confidence ? 'filled' : ''}"></i>`
-    ).join('');
+      const segments = Array.from(
+        {length: 10},
+        (_, i) =>
+          `<i class="${
+            (i + 1) * 10 <= p.confidence ? 'filled' : ''
+          }"></i>`
+      ).join('');
 
-    return `
-      <article class="forecast-card">
-        <div class="forecast-top">
-          <span class="horizon-label">
-            For ${horizonText(p.horizon)}
-          </span>
-          <span class="forecast-target">${status}</span>
-        </div>
+      return `
+        <article class="forecast-card">
+          <div class="forecast-top">
+            <span class="horizon-label">
+              For ${horizonText(p.horizon)}
+            </span>
+            <span class="forecast-target">${status}</span>
+          </div>
 
-        <div class="forecast-direction ${kind}">
-          <span class="direction-icon">${icon}</span>
-          <strong class="direction-label">${p.direction}</strong>
-          <span class="direction-detail">${label}</span>
-        </div>
+          <div class="forecast-direction ${kind}">
+            <span class="direction-icon">${icon}</span>
+            <strong class="direction-label">${p.direction}</strong>
+            <span class="direction-detail">${label}</span>
+          </div>
 
-        <div class="signal-strength">
-          <span>Signal strength</span>
-          <strong>${p.confidence} / 100</strong>
-        </div>
+          <div class="signal-strength">
+            <span>Signal strength</span>
+            <strong>${p.confidence} / 100</strong>
+          </div>
 
-        <div class="strength-track ${p.direction.toLowerCase()}">
-          ${segments}
-        </div>
+          <div class="strength-track ${p.direction.toLowerCase()}">
+            ${segments}
+          </div>
 
-        <p class="reasons">
-          ${escapeHTML(p.reasons[0])} · RSI ${p.indicators.rsi14.toFixed(0)}
-          <br>
-          Neutral zone ±${p.neutral_pct.toFixed(2)}%
-          <br>
-          Calculated ${timeText(p.issued_at)} · reference ${timeText(p.reference_at)}
-        </p>
-      </article>
-    `;
-  }).join('');
+          <p class="reasons">
+            ${escapeHTML(p.reasons[0])}
+            · RSI ${p.indicators.rsi14.toFixed(0)}
+            <br>
+            Neutral zone ±${p.neutral_pct.toFixed(2)}%
+            <br>
+            Calculated ${timeText(p.issued_at)}
+            · reference ${timeText(p.reference_at)}
+          </p>
+        </article>
+      `;
+    }).join('');
 }
 
 function renderStats(data) {
@@ -275,95 +296,115 @@ function renderStats(data) {
 }
 
 function renderHistory(data) {
-  $('history-body').innerHTML = data.items.length
-    ? data.items.map(p => {
-        const done = p.evaluated_at != null;
+  $('history-body').innerHTML =
+    data.items.length
+      ? data.items.map(p => {
+          const done = p.evaluated_at != null;
 
-        const status = done
-          ? (p.correct ? 'Confirmed' : 'Not confirmed')
-          : (p.due_at < Date.now()
-              ? 'Awaiting data'
-              : 'Awaiting evaluation');
+          const status =
+            done
+              ? (p.correct ? 'Confirmed' : 'Not confirmed')
+              : (
+                  p.due_at < Date.now()
+                    ? 'Awaiting data'
+                    : 'Awaiting evaluation'
+                );
 
-        const note = done
-          ? `Checked ${dateText(p.evaluated_at)}`
-          : p.evaluation_note ||
-            `Target time ${dateText(p.due_at)}`;
+          const note =
+            done
+              ? `Checked ${dateText(p.evaluated_at)}`
+              : p.evaluation_note ||
+                `Target time ${dateText(p.due_at)}`;
 
-        return `
-          <tr>
-            <td>
-              ${dateText(p.issued_at)}
-              <small>
-                Reference ${timeText(p.reference_at)} ·
-                ${escapeHTML(p.model_version)}
-              </small>
-            </td>
+          return `
+            <tr>
+              <td>
+                ${dateText(p.issued_at)}
+                <small>
+                  Reference ${timeText(p.reference_at)} ·
+                  ${escapeHTML(p.model_version)}
+                </small>
+              </td>
 
-            <td>
-              ${horizonText(p.horizon)}
-              <small>Until ${dateText(p.due_at)}</small>
-            </td>
+              <td>
+                ${horizonText(p.horizon)}
+                <small>Until ${dateText(p.due_at)}</small>
+              </td>
 
-            <td>
-              <span class="badge ${p.direction}">
-                ${p.direction === 'UP'
-                  ? '↗'
-                  : p.direction === 'DOWN'
-                    ? '↘'
-                    : '→'}
-                ${p.direction}
-              </span>
-              <small>Strength ${p.confidence}/100</small>
-            </td>
+              <td>
+                <span class="badge ${p.direction}">
+                  ${
+                    p.direction === 'UP'
+                      ? '↗'
+                      : p.direction === 'DOWN'
+                        ? '↘'
+                        : '→'
+                  }
+                  ${p.direction}
+                </span>
+                <small>Strength ${p.confidence}/100</small>
+              </td>
 
-            <td>
-              $${number(p.base_price)}
-              <small>Threshold ±${p.neutral_pct.toFixed(2)}%</small>
-            </td>
+              <td>
+                $${number(p.base_price)}
+                <small>
+                  Threshold ±${p.neutral_pct.toFixed(2)}%
+                </small>
+              </td>
 
-            <td>
-              ${
-                done
-                  ? `$${number(p.actual_price)}
-                     <small class="${p.change_pct >= 0 ? 'positive' : 'negative'}">
-                       ${signed(p.change_pct)} · ${p.observed_direction}
-                     </small>`
-                  : '—'
-              }
-            </td>
+              <td>
+                ${
+                  done
+                    ? `$${number(p.actual_price)}
+                       <small class="${
+                         p.change_pct >= 0
+                           ? 'positive'
+                           : 'negative'
+                       }">
+                         ${signed(p.change_pct)}
+                         · ${p.observed_direction}
+                       </small>`
+                    : '—'
+                }
+              </td>
 
-            <td title="${escapeHTML(note)}">
-              <span class="result-dot ${
-                done
-                  ? (p.correct ? 'win' : 'loss')
-                  : ''
-              }"></span>
-              ${status}
-              <small>
-                ${done
-                  ? 'Actual movement'
-                  : 'Checked using 1m close'}
-              </small>
-            </td>
-          </tr>
-        `;
-      }).join('')
-    : `
-      <tr>
-        <td colspan="6">
-          <div class="empty">
-            Real forecasts and their evaluation results will appear here.
-            <br>
-            The first result appears after the 30-minute horizon is completed.
-          </div>
-        </td>
-      </tr>
-    `;
+              <td title="${escapeHTML(note)}">
+                <span class="result-dot ${
+                  done
+                    ? (p.correct ? 'win' : 'loss')
+                    : ''
+                }"></span>
+
+                ${status}
+
+                <small>
+                  ${
+                    done
+                      ? 'Actual movement'
+                      : 'Checked using 1m close'
+                  }
+                </small>
+              </td>
+            </tr>
+          `;
+        }).join('')
+      : `
+        <tr>
+          <td colspan="6">
+            <div class="empty">
+              Real forecasts and their evaluation results will appear here.
+              <br>
+              The first result appears after the 30-minute horizon is completed.
+            </div>
+          </td>
+        </tr>
+      `;
 
   $('history-count').textContent =
     data.total
-      ? `${state.offset + 1}–${Math.min(state.offset + 20, data.total)} of ${data.total} records`
+      ? `${state.offset + 1}–${
+          Math.min(state.offset + 20, data.total)
+        } of ${data.total} records`
       : '0 records';
 
   $('previous').disabled = state.offset === 0;
@@ -371,13 +412,21 @@ function renderHistory(data) {
 }
 
 function renderStatus(data) {
-  state.errors.worker = Object.values(data.errors).join(' ');
+  state.errors.worker =
+    Object.values(data.errors).join(' ');
 
   const notice =
     data.storage === 'sqlite'
-      ? 'Local run: history is stored in data/crypto.db on this computer. PostgreSQL is configured for Render.'
+      ? (
+          'Local run: history is stored in data/crypto.db ' +
+          'on this computer. PostgreSQL is configured for Render.'
+        )
       : data.render_free
-        ? "On Render's free tier the server may sleep. After waking, saved forecasts are evaluated; missed forecasts are not backfilled."
+        ? (
+            "On Render's free tier the server may sleep. " +
+            'After waking, saved forecasts are evaluated; ' +
+            'missed forecasts are not backfilled.'
+          )
         : '';
 
   $('storage-notice').textContent = notice;
@@ -393,27 +442,37 @@ async function refreshAll() {
   state.busy = version + 1;
   $('refresh-icon').classList.add('spin');
 
-  const params = `symbol=${encodeURIComponent(symbol)}`;
-  const chartKey = symbol + state.interval;
+  const params =
+    `symbol=${encodeURIComponent(symbol)}`;
 
+  const chartKey =
+    symbol + state.interval;
+
+  /*
+    Only the currently selected cryptocurrency
+    is requested from the market API.
+
+    The old separate BTC and ETH quote requests
+    have been removed.
+  */
   const tasks = [
     [
       'market',
       `/api/market?${params}&interval=${state.interval}`,
       data => {
         updateQuote(data.ticker);
+
         chart.setData(
           data.candles,
           state.lastChartKey !== chartKey
         );
+
         state.lastChartKey = chartKey;
         state.marketGood = true;
+
         $('chart-message').classList.add('hidden');
       }
     ],
-
-    ['btcquote', '/api/quote?symbol=BTCUSDT', updateQuote],
-    ['ethquote', '/api/quote?symbol=ETHUSDT', updateQuote],
 
     [
       'forecasts',
@@ -441,10 +500,14 @@ async function refreshAll() {
   ];
 
   const results = await Promise.allSettled(
-    tasks.map(t => api(t[1]))
+    tasks.map(task => api(task[1]))
   );
 
-  if (state.version !== version) return;
+  if (state.version !== version) {
+    state.busy = false;
+    $('refresh-icon').classList.remove('spin');
+    return;
+  }
 
   results.forEach((result, index) => {
     const [key, , render] = tasks[index];
@@ -460,24 +523,34 @@ async function refreshAll() {
 
       if (key === 'market') {
         state.marketGood = false;
+
         $('chart-message').textContent =
-          'Could not update the chart. The latest loaded candles may be stale.';
+          'Could not update the chart. ' +
+          'The latest loaded candles may be stale.';
+
         $('chart-message').classList.remove('hidden');
       }
 
       if (key === 'history') {
         $('history-body').innerHTML =
-          '<tr><td colspan="6"><div class="empty">The forecast log is temporarily unavailable. We will retry automatically.</div></td></tr>';
+          '<tr><td colspan="6"><div class="empty">' +
+          'The forecast log is temporarily unavailable. ' +
+          'We will retry automatically.' +
+          '</div></td></tr>';
       }
 
       if (key === 'forecasts') {
         $('forecast-cards').innerHTML =
-          '<div class="empty compact">Forecasts are temporarily unavailable.<br>We will retry automatically.</div>';
+          '<div class="empty compact">' +
+          'Forecasts are temporarily unavailable.<br>' +
+          'We will retry automatically.' +
+          '</div>';
       }
     }
   });
 
   renderError();
+
   state.busy = false;
   $('refresh-icon').classList.remove('spin');
 }
@@ -500,15 +573,21 @@ function selectSymbol(symbol) {
   $('main-change').textContent = '—';
 
   $('forecast-cards').innerHTML =
-    '<div class="empty compact">Loading forecasts…</div>';
+    '<div class="empty compact">' +
+    'Loading forecasts…' +
+    '</div>';
 
-  $('chart-message').textContent = 'Loading candles…';
+  $('chart-message').textContent =
+    'Loading candles…';
+
   $('chart-message').classList.remove('hidden');
 
   renderStats({items: []});
 
   $('history-body').innerHTML =
-    '<tr><td colspan="6"><div class="empty">Loading…</div></td></tr>';
+    '<tr><td colspan="6"><div class="empty">' +
+    'Loading…' +
+    '</div></td></tr>';
 
   updateSelectedSymbolUI();
   changeView();
@@ -517,6 +596,7 @@ function selectSymbol(symbol) {
 document.querySelectorAll('[data-symbol]').forEach(button => {
   button.addEventListener('click', () => {
     if (button.dataset.symbol === state.symbol) return;
+
     selectSymbol(button.dataset.symbol);
   });
 });
@@ -536,7 +616,9 @@ document.querySelectorAll('[data-interval]').forEach(button => {
 
 document.querySelectorAll('[data-horizon]').forEach(button => {
   button.addEventListener('click', () => {
-    state.horizon = Number(button.dataset.horizon);
+    state.horizon =
+      Number(button.dataset.horizon);
+
     state.offset = 0;
 
     document.querySelectorAll('[data-horizon]').forEach(b => {
@@ -549,7 +631,9 @@ document.querySelectorAll('[data-horizon]').forEach(button => {
 });
 
 $('previous').addEventListener('click', () => {
-  state.offset = Math.max(0, state.offset - 20);
+  state.offset =
+    Math.max(0, state.offset - 20);
+
   changeView();
 });
 
@@ -558,11 +642,25 @@ $('next').addEventListener('click', () => {
   changeView();
 });
 
-$('zoom-in').addEventListener('click', () => chart.zoom(.8));
-$('zoom-out').addEventListener('click', () => chart.zoom(1.25));
-$('chart-reset').addEventListener('click', () => chart.reset());
+$('zoom-in').addEventListener(
+  'click',
+  () => chart.zoom(.8)
+);
 
-$('refresh').addEventListener('click', () => refreshAll());
+$('zoom-out').addEventListener(
+  'click',
+  () => chart.zoom(1.25)
+);
+
+$('chart-reset').addEventListener(
+  'click',
+  () => chart.reset()
+);
+
+$('refresh').addEventListener(
+  'click',
+  () => refreshAll()
+);
 
 document.querySelectorAll('.nav-link').forEach(link =>
   link.addEventListener('click', () => {
@@ -572,6 +670,13 @@ document.querySelectorAll('.nav-link').forEach(link =>
   })
 );
 
+
+/*
+  Update only the currently selected cryptocurrency price.
+
+  Old interval: 15 seconds.
+  New interval: 30 seconds.
+*/
 let quoteBusy = false;
 
 setInterval(async () => {
@@ -584,25 +689,45 @@ setInterval(async () => {
 
   try {
     const quote = await api(
-      '/api/quote?symbol=' + encodeURIComponent(symbol)
+      '/api/quote?symbol=' +
+      encodeURIComponent(symbol)
     );
 
     if (version === state.version) {
       updateQuote(quote);
     }
   } catch {
+    // Full refresh handles visible connection errors.
   } finally {
     quoteBusy = false;
   }
-}, 15000);
-
-setInterval(() => {
-  if (!document.hidden) refreshAll();
 }, 30000);
 
+
+/*
+  Full refresh:
+  chart, forecasts, history, statistics and status.
+
+  Old interval: 30 seconds.
+  New interval: 2 minutes.
+*/
+setInterval(() => {
+  if (!document.hidden) {
+    refreshAll();
+  }
+}, 120000);
+
+
+/*
+  Refresh immediately when the user
+  returns to the browser tab.
+*/
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refreshAll();
+  if (!document.hidden) {
+    refreshAll();
+  }
 });
+
 
 const symbolSearch = $('symbol-search');
 
@@ -624,10 +749,12 @@ symbolSearch?.addEventListener('keydown', event => {
     symbol += 'USDT';
   }
 
-  symbolSearch.value = symbol.slice(0, -4);
+  symbolSearch.value =
+    symbol.slice(0, -4);
 
   selectSymbol(symbol);
 });
+
 
 updateSelectedSymbolUI();
 refreshAll();
