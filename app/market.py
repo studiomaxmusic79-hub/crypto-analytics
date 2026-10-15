@@ -11,7 +11,7 @@ INTERVALS = {
 }
 
 BASE_URL = "https://data-api.binance.vision"
-SYMBOLS = None
+SYMBOLS = ("BTCUSDT", "ETHUSDT")
 
 class MarketError(Exception):
     pass
