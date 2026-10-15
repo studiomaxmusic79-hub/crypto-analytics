@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111a20">
+  <meta name="description" content="Online cryptocurrency analysis using Binance data: Bitcoin, Ethereum and other coins, charts, technical indicators, and experimental 30-minute, 1-hour and 4-hour price forecasts.">
+<title>Krypta — Crypto Analysis & Forecasts | BTC, ETH, Binance</title>
+  <link rel="canonical" href="https://crypto-analytics-zh7n.onrender.com/en/">
+  <link rel="alternate" hreflang="ru" href="https://crypto-analytics-zh7n.onrender.com/">
+  <link rel="alternate" hreflang="en" href="https://crypto-analytics-zh7n.onrender.com/en/">
+  <link rel="alternate" hreflang="x-default" href="https://crypto-analytics-zh7n.onrender.com/">
+<meta name="robots" content="index, follow">
+<meta name="googlebot" content="index, follow">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/chart.js" defer></script>
+  <script src="/static/app-en.js" defer></script>
+</head>
+
+<body>
+
+<aside class="sidebar">
+  <a class="brand" href="#overview" aria-label="Krypta, overview">
+    <span class="brand-mark">κ</span>krypta<span class="brand-dot">.</span>
+  </a>
+
+  <div class="workspace-label">MARKET OBSERVATORY</div>
+
+  <nav aria-label="Navigation">
+    <a class="nav-link active" href="#overview"><span>◫</span> Market overview</a>
+    <a class="nav-link" href="#signals"><span>↗</span> Forecasts</a>
+    <a class="nav-link" href="#history"><span>◷</span> History</a>
+    <a class="nav-link" href="#method"><span>≋</span> Methodology</a>
+  </nav>
+
+  <div class="sidebar-bottom">
+    <div class="read-only-icon">⌁</div>
+    <strong>Observation only</strong>
+    <p>Public data.<br>No API keys or trading.</p>
+    <span class="version">EXPERIMENTAL · V1.0</span>
+  </div>
+</aside>
+
+<main id="overview">
+
+  <header class="topbar">
+    <div class="breadcrumb">
+      Workspace <span>/</span> <strong>Overview</strong>
+    </div>
+
+    <div class="connection">
+      <span class="status-dot" id="connection-dot"></span>
+      <span id="connection-text">Connecting to Binance</span>
+    </div>
+  </header>
+
+  <div class="page-content">
+
+    <section class="page-heading">
+      <div>
+        <p class="eyebrow">DATA → SIGNAL → VERIFICATION</p>
+        <h1>Market under observation<span>.</span></h1>
+        <p class="subtitle">Less guessing. More verifiable forecasts.</p>
+      </div>
+
+      <button id="refresh" class="button subtle" type="button">
+        <span id="refresh-icon">↻</span> Refresh
+      </button>
+    </section>
+
+    <div class="notice error hidden" id="error" role="alert"></div>
+    <div class="notice hidden" id="storage-notice"></div>
+
+    <section class="market-cards" aria-label="Select trading pair">
+
+      <button class="market-card selected" data-symbol="BTCUSDT" aria-pressed="true">
+        <span class="coin-icon btc">₿</span>
+
+        <span class="coin-info">
+          <strong>
+            Bitcoin
+            <small>BTC / USDT</small>
+          </strong>
+          <span class="market-value" id="btc-price">—</span>
+        </span>
+
+        <span class="coin-right">
+          <span class="market-change" id="btc-change">Loading…</span>
+          <span class="small-label">over 24 hours</span>
+        </span>
+
+        <span class="selected-indicator">↗</span>
+      </button>
+
+      <button class="market-card" data-symbol="ETHUSDT" aria-pressed="false">
+        <span class="coin-icon eth">♦</span>
+
+        <span class="coin-info">
+          <strong>
+            Ethereum
+            <small>ETH / USDT</small>
+          </strong>
+          <span class="market-value" id="eth-price">—</span>
+        </span>
+
+        <span class="coin-right">
+          <span class="market-change" id="eth-change">Loading…</span>
+          <span class="small-label">over 24 hours</span>
+        </span>
+
+        <span class="selected-indicator">↗</span>
+      </button>
+
+      <input
+        id="symbol-search"
+        type="text"
+        placeholder="Enter a coin, e.g. SOL"
+      >
+
+    </section>
+
+    <div class="analysis-grid">
+
+      <section class="panel chart-panel" aria-labelledby="chart-title">
+
+        <div class="panel-top">
+          <div>
+            <div class="section-kicker">PRICE MOVEMENT</div>
+            <h2 id="chart-title">
+              BTC / USDT
+              <span class="exchange-label">BINANCE</span>
+            </h2>
+          </div>
+
+          <div class="segmented" id="intervals" aria-label="Candle interval">
+            <button data-interval="15m" aria-pressed="false">15m</button>
+            <button data-interval="1h" class="active" aria-pressed="true">1h</button>
+            <button data-interval="4h" aria-pressed="false">4h</button>
+          </div>
+        </div>
+
+        <div class="quote-line">
+          <strong id="main-price">—</strong>
+          <span id="main-change">—</span>
+          <span class="currency-label">USDT</span>
+        </div>
+
+        <div class="ohlc" id="ohlc" aria-live="off">
+          Loading candles…
+        </div>
+
+        <div class="chart-wrap">
+          <canvas
+            id="chart"
+            role="img"
+            aria-label="Interactive candlestick price chart."
+          ></canvas>
+
+          <div class="chart-message" id="chart-message">
+            Loading public Binance data…
+          </div>
+        </div>
+
+        <div class="chart-bottom">
+          <span>
+            <i class="legend-dot"></i>
+            Volume
+            <span class="chart-hint">· Hover over a candle</span>
+          </span>
+
+          <div class="chart-controls">
+            <button id="zoom-out" aria-label="Zoom out">−</button>
+            <button id="zoom-in" aria-label="Zoom in">+</button>
+            <button id="chart-reset" aria-label="Show latest candles">↺</button>
+          </div>
+
+          <span id="updated">—</span>
+        </div>
+
+      </section>
+
+      <section class="panel signals-panel" id="signals" aria-labelledby="signals-title">
+
+        <div class="panel-top">
+          <div>
+            <div class="section-kicker">NEXT MOVE</div>
+            <h2 id="signals-title">Movement forecast</h2>
+          </div>
+
+          <span class="beta-tag">BETA</span>
+        </div>
+
+        <div id="forecast-cards" class="forecast-list">
+          <div class="empty compact">
+            The first forecast will appear after candle data loads.
+          </div>
+        </div>
+
+        <div class="signal-disclaimer">
+          <span>ⓘ</span>
+          <p>
+            Signal strength is an indicator-based score,
+            <strong>not a probability of success</strong>.
+            Probability is not calibrated.
+          </p>
+        </div>
+
+      </section>
+
+    </div>
+
+    <section class="stats-grid" aria-label="Verification results">
+
+      <div class="stat">
+        <span class="stat-label">
+          UP / DOWN accuracy <span>30M</span>
+        </span>
+        <strong id="accuracy-30">—</strong>
+        <small id="sample-30">No completed forecasts</small>
+      </div>
+
+      <div class="stat">
+        <span class="stat-label">
+          UP / DOWN accuracy <span>1H</span>
+        </span>
+        <strong id="accuracy-1">—</strong>
+        <small id="sample-1">No completed forecasts</small>
+      </div>
+
+      <div class="stat">
+        <span class="stat-label">
+          UP / DOWN accuracy <span>4H</span>
+        </span>
+        <strong id="accuracy-4">—</strong>
+        <small id="sample-4">No completed forecasts</small>
+      </div>
+
+      <div class="stat">
+        <span class="stat-label">
+          WAIT results <span>SEPARATE</span>
+        </span>
+        <strong id="wait-score">—</strong>
+        <small id="wait-sample">Share within the neutral zone</small>
+      </div>
+
+      <div class="stat">
+        <span class="stat-label">
+          Forecasts verified <span>TOTAL</span>
+        </span>
+        <strong id="evaluated-total">0</strong>
+        <small id="pending-total">History начнётся с первого расчёта</small>
+      </div>
+
+    </section>
+
+    <section class="panel history-panel" id="history" aria-labelledby="history-title">
+
+      <div class="panel-top">
+        <div>
+          <div class="section-kicker">
+            FORECAST MEETS REALITY
+          </div>
+          <h2 id="history-title">Forecast log</h2>
+        </div>
+
+        <a
+          id="export"
+          class="button subtle"
+          href="/api/export.csv?symbol=BTCUSDT"
+          download
+        >
+          ↓ <span>Download CSV</span>
+        </a>
+      </div>
+
+      <div class="history-toolbar">
+
+        <div
+          class="segmented"
+          id="history-filters"
+          aria-label="Forecast horizon"
+        >
+          <button data-horizon="0" class="active" aria-pressed="true">
+            All
+          </button>
+
+          <button data-horizon="30" aria-pressed="false">
+            30 minutes
+          </button>
+
+          <button data-horizon="1" aria-pressed="false">
+            1 hour
+          </button>
+
+          <button data-horizon="4" aria-pressed="false">
+            4 hours
+          </button>
+        </div>
+
+        <span class="small-label">
+          Time on your device
+        </span>
+
+      </div>
+
+      <div class="table-scroll">
+
+        <table>
+
+          <thead>
+            <tr>
+              <th>Created</th>
+              <th>Horizon</th>
+              <th>Forecast</th>
+              <th>Reference price</th>
+              <th>Actual / movement</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+
+          <tbody id="history-body">
+            <tr>
+              <td colspan="6">
+                <div class="empty">
+                  Loading forecast log…
+                </div>
+              </td>
+            </tr>
+          </tbody>
+
+        </table>
+
+      </div>
+
+      <div class="table-footer">
+
+        <span id="history-count">
+          0 records
+        </span>
+
+        <div>
+          <button
+            class="button subtle"
+            id="previous"
+            disabled
+          >
+            ← Previous
+          </button>
+
+          <button
+            class="button subtle"
+            id="next"
+            disabled
+          >
+            Next →
+          </button>
+        </div>
+
+      </div>
+
+    </section>
+
+    <section class="method-section" id="method">
+
+      <div>
+        <span class="section-kicker">
+          TRANSPARENT METHODOLOGY
+        </span>
+
+        <h2>
+          Know where the<br>
+          signal comes from.
+        </h2>
+
+        <p>
+          Experimental forecasts.<br>
+          Results are not guaranteed.
+        </p>
+      </div>
+
+      <div class="method-details">
+
+        <details>
+          <summary>
+            <span>01</span>
+            How the forecast is calculated
+            <b>+</b>
+          </summary>
+
+          <p>
+            Для 30 minutes и 1 hourа анализируем 100 закрытых
+            15-минутных свечей, для 4 часов — 100 часовых.
+            Считаем EMA12/26, RSI14, ATR14 и импульс.
+            Взвешенный сигнал S = 0,5 × тренд +
+            0,3 × импульс + 0,2 × RSI.
+            Сила сигнала = |S| × 100.
+            Это эвристическая шкала, не вероятность.
+          </p>
+        </details>
+
+        <details>
+          <summary>
+            <span>02</span>
+            When WAIT is selected
+            <b>+</b>
+          </summary>
+
+          <p>
+            Для прогноза на 30 minutes расчёт ожидаемого движения
+            учитывает 2 свечи по 15 минут.
+            Для 1 hourа — 4 свечи по 15 минут,
+            для 4 часов — 4 часовые свечи.
+            WAIT выбирается при слабом сигнале
+            или если ожидаемое движение остаётся
+            внутри нейтральной зоны.
+          </p>
+        </details>
+
+        <details>
+          <summary>
+            <span>03</span>
+            How results are verified
+            <b>+</b>
+          </summary>
+
+          <p>
+            Reference price — закрытие последней доступной минутной свечи.
+            Для 30-минутного прогноза результат проверяется через 30 minutes,
+            для остальных — через 1 или 4 hours.
+            Фактическое движение сравнивается с нейтральной зоной,
+            зафиксированной при создании прогноза.
+            UP / DOWN и WAIT оцениваются по фактическому движению цены.
+          </p>
+        </details>
+
+        <details>
+          <summary>
+            <span>04</span>
+            Updates, gaps and server sleep
+            <b>+</b>
+          </summary>
+
+          <p>
+            Price updates every 15 seconds;
+            candles and the forecast log update every 30 seconds.
+            New forecasts are generated every 15 minutes
+            while the server is running.
+            No forecast is created when data is unavailable.
+            After server sleep, saved forecasts are checked
+            against historical candles.
+            Missed forecasts are not backfilled.
+          </p>
+        </details>
+
+      </div>
+
+    </section>
+
+    <footer>
+      <a class="footer-brand" href="#overview">krypta.</a>
+      <span>Public Binance data · No access to funds</span>
+      <span>Observe. Verify. Draw conclusions.</span>
+    </footer>
+
+  </div>
+</main>
+
+</body>
+</html>
