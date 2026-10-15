@@ -14,7 +14,7 @@ from .service import ForecastService
 from .storage import Store
 
 STATIC = Path(__file__).parent / "static"
-Symbol = Literal["BTCUSDT", "ETHUSDT"]
+Symbol = str
 
 
 @asynccontextmanager
