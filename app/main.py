@@ -98,7 +98,10 @@ async def quote(request: Request, symbol: Symbol = "BTCUSDT"):
 
 
 @app.get("/api/forecasts")
-def forecasts(request: Request, symbol: Symbol = "BTCUSDT"):
+async def forecasts(request: Request, symbol: Symbol = "BTCUSDT"):
+    symbol = symbol.upper().strip()
+    now = await request.app.state.market.time_ms()
+    await request.app.state.service.generate(symbol, now)
     return {"items": request.app.state.store.latest(symbol)}
 
 
