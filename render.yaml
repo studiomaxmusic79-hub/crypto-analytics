@@ -1,0 +1,16 @@
+# Creates only a free web service. Supply your existing free PostgreSQL connection.
+# No database, paid worker, cron or persistent disk is provisioned by this file.
+services:
+  - type: web
+    name: krypta-analytics
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1 --no-server-header
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: DATABASE_URL
+        sync: false
