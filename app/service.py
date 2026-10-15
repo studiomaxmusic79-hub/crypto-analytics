@@ -12,7 +12,7 @@ class ForecastService:
 
     async def generate(self, symbol, now):
         slot = now // 900_000
-        missing = [h for h in (1, 4) if not await asyncio.to_thread(self.store.has_slot, symbol, h, slot)]
+        missing = [h for h in (0.5, 1, 4) if not await asyncio.to_thread(self.store.has_slot, symbol, h, slot)]
         if not missing:
             return
         recent = await self.market.klines(symbol, "1m", limit=3)
@@ -24,7 +24,7 @@ class ForecastService:
         if not 0 <= now - reference_at <= 90_000:
             raise MarketError("Минутные данные устарели; прогноз не сформирован")
         for horizon in missing:
-            interval = "15m" if horizon == 1 else "1h"
+            interval = "15m" if horizon in (0.5, 1) else "1h"
             candles = await self.market.klines(symbol, interval, limit=120, endTime=reference_at - 1)
             candles = [c for c in candles if int(c[6]) < reference_at]
             if not candles or int(candles[-1][6]) + 1 != reference_at // INTERVALS[interval] * INTERVALS[interval]:
@@ -36,7 +36,7 @@ class ForecastService:
             await asyncio.to_thread(self.store.save, {
                 **prediction, "symbol": symbol, "horizon": horizon, "slot": slot,
                 "issued_at": issued_at, "reference_at": reference_at,
-                "due_at": reference_at + horizon * 3_600_000, "base_price": float(base[4])})
+                "due_at": reference_at + int(horizon * 3_600_000), "base_price": float(base[4])})
 
     async def settle(self, now):
         rows = await asyncio.to_thread(self.store.pending, now - 3000)
