@@ -103,9 +103,11 @@ def forecasts(request: Request, symbol: Symbol = "BTCUSDT"):
 
 
 @app.get("/api/history")
-def history(request: Request, symbol: Symbol = "BTCUSDT", horizon: Literal[0, 1, 4] = 0,
-            offset: int = Query(0, ge=0, le=1_000_000), limit: int = Query(20, ge=1, le=100)):
-    return request.app.state.store.history(symbol, horizon, offset, limit)
+def history(request: Request, symbol: Symbol = "BTCUSDT",
+            horizon: Literal["0", "1", "4"] = "0",
+            offset: int = Query(0, ge=0, le=1_000_000),
+            limit: int = Query(20, ge=1, le=100)):
+    return request.app.state.store.history(symbol, int(horizon), offset, limit)
 
 
 @app.get("/api/stats")
