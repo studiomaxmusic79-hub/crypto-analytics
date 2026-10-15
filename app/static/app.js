@@ -140,3 +140,20 @@ setInterval(async () => {
 setInterval(() => {if (!document.hidden) refreshAll();}, 30000);
 document.addEventListener('visibilitychange', () => {if (!document.hidden) refreshAll();});
 refreshAll();
+const symbolSearch = document.getElementById("symbol-search");
+
+symbolSearch?.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+
+    const symbol = symbolSearch.value
+        .trim()
+        .toUpperCase()
+        .replace("/", "")
+        .replace("-", "");
+
+    if (!symbol) return;
+
+    state.symbol = symbol;
+    state.offset = 0;
+    await refresh();
+});
