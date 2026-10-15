@@ -52,6 +52,12 @@ const displaySymbol = symbol => {
   return symbol;
 };
 
+const horizonText = horizon => {
+  if (horizon === 30) return '30 минут';
+  if (horizon === 1) return '1 час';
+  return '4 часа';
+};
+
 const chart = new CandleChart($('chart'), c => {
   $('ohlc').textContent =
     `${dateText(c.time)}   O ${number(c.open)}   H ${number(c.high)}   ` +
@@ -90,7 +96,6 @@ function updateMarketCard(prefix, ticker) {
 }
 
 function updateQuote(ticker) {
-  // Верхние карточки BTC и ETH всегда остаются BTC и ETH.
   if (ticker.symbol === 'BTCUSDT') {
     updateMarketCard('btc', ticker);
   }
@@ -99,7 +104,6 @@ function updateQuote(ticker) {
     updateMarketCard('eth', ticker);
   }
 
-  // Основной график и большая цена показывают выбранную монету.
   if (ticker.symbol === state.symbol) {
     $('main-price').textContent = number(ticker.price);
     $('main-change').textContent = signed(ticker.change_pct);
@@ -193,7 +197,7 @@ function renderForecasts(data) {
       <article class="forecast-card">
         <div class="forecast-top">
           <span class="horizon-label">
-            На ${p.horizon === 1 ? '1 час' : '4 часа'}
+            На ${horizonText(p.horizon)}
           </span>
           <span class="forecast-target">${status}</span>
         </div>
@@ -231,7 +235,7 @@ function renderStats(data) {
   let waits = 0;
   let waitCorrect = 0;
 
-  for (const h of [1, 4]) {
+  for (const h of [30, 1, 4]) {
     const s = data.items.find(x => x.horizon === h);
 
     $('accuracy-' + h).textContent =
@@ -297,7 +301,7 @@ function renderHistory(data) {
             </td>
 
             <td>
-              ${p.horizon} ${p.horizon === 1 ? 'час' : 'часа'}
+              ${horizonText(p.horizon)}
               <small>До ${dateText(p.due_at)}</small>
             </td>
 
@@ -351,7 +355,7 @@ function renderHistory(data) {
           <div class="empty">
             Здесь появятся реальные прогнозы и результаты их проверки.
             <br>
-            Первый результат — после завершения горизонта 1 час.
+            Первый результат — после завершения горизонта 30 минут.
           </div>
         </td>
       </tr>
@@ -408,17 +412,8 @@ async function refreshAll() {
       }
     ],
 
-    [
-      'btcquote',
-      '/api/quote?symbol=BTCUSDT',
-      updateQuote
-    ],
-
-    [
-      'ethquote',
-      '/api/quote?symbol=ETHUSDT',
-      updateQuote
-    ],
+    ['btcquote', '/api/quote?symbol=BTCUSDT', updateQuote],
+    ['ethquote', '/api/quote?symbol=ETHUSDT', updateQuote],
 
     [
       'forecasts',
@@ -625,7 +620,6 @@ symbolSearch?.addEventListener('keydown', event => {
 
   if (!symbol) return;
 
-  // Пользователь может написать SOL вместо SOLUSDT.
   if (!symbol.endsWith('USDT')) {
     symbol += 'USDT';
   }
