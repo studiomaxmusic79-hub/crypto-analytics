@@ -2,7 +2,7 @@ import asyncio
 import time
 
 from .analytics import analyze, evaluate
-from .market import SYMBOLS, INTERVALS, MarketError
+from .market import INTERVALS, MarketError
 
 
 class ForecastService:
@@ -11,6 +11,20 @@ class ForecastService:
         self.store = store
         self.last_cycle_at = None
         self.errors = {}
+
+        # Валюта, для которой сейчас нужен
+        # автоматический расчёт прогнозов.
+        self.active_symbol = "BTCUSDT"
+
+    def set_active_symbol(self, symbol):
+        symbol = symbol.upper().strip()
+
+        if not symbol.endswith("USDT"):
+            raise ValueError(
+                "Поддерживаются пары к USDT"
+            )
+
+        self.active_symbol = symbol
 
     async def generate(self, symbol, now):
         slot = now // 900_000
@@ -191,8 +205,8 @@ class ForecastService:
                 break
 
     async def cycle(self):
-        # Получаем время Binance один раз
-        # и используем его для всего цикла.
+        # Время Binance получаем только один раз
+        # за весь цикл.
         now = await self.market.time_ms()
 
         self.errors.pop(
@@ -200,30 +214,34 @@ class ForecastService:
             None
         )
 
-        for symbol in SYMBOLS:
-            try:
-                await self.generate(
-                    symbol,
-                    now
-                )
+        # Вместо постоянного расчёта сразу
+        # BTC и ETH работаем только с той валютой,
+        # которая сейчас выбрана пользователем.
+        symbol = self.active_symbol
 
-                self.errors.pop(
-                    symbol,
-                    None
-                )
+        try:
+            await self.generate(
+                symbol,
+                now
+            )
 
-            except (
-                MarketError,
-                ValueError
-            ) as exc:
-                self.errors[symbol] = str(exc)
+            self.errors.pop(
+                symbol,
+                None
+            )
+
+        except (
+            MarketError,
+            ValueError
+        ) as exc:
+            self.errors[symbol] = str(exc)
 
         self.errors.pop(
             "evaluation",
             None
         )
 
-        # Второй запрос времени Binance больше не нужен.
+        # Проверяем ранее сохранённые прогнозы.
         await self.settle(now)
 
         self.last_cycle_at = int(
@@ -248,6 +266,5 @@ class ForecastService:
                     "и журнал сервера."
                 )
 
-            # Раньше цикл запускался каждые 30 секунд.
-            # Для прогнозов раз в 15 минут это избыточно.
+            # Полный фоновый цикл раз в 2 минуты.
             await asyncio.sleep(120)
