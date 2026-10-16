@@ -5,7 +5,7 @@ from pathlib import Path
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, BigInteger,
     String, Float, Text, Boolean, UniqueConstraint, CheckConstraint,
-    select, func, case, and_
+    select, func, case, and_, or_, inspect, text
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -72,6 +72,8 @@ market_candles = Table(
     Column("close", Float, nullable=False),
     Column("volume", Float, nullable=False),
     Column("close_time", BigInteger, nullable=False),
+    # Set only by a successful collection made after this candle closed.
+    Column("confirmed_at", BigInteger),
 )
 
 
@@ -193,6 +195,13 @@ class Store:
 
     def init(self):
         metadata.create_all(self.engine)
+        # create_all does not add columns to an existing Neon/SQLite table.
+        with self.engine.begin() as conn:
+            if "confirmed_at" not in {c["name"] for c in inspect(conn).get_columns("market_candles")}:
+                optional = " IF NOT EXISTS" if conn.dialect.name == "postgresql" else ""
+                conn.execute(text(
+                    f"ALTER TABLE market_candles ADD COLUMN{optional} confirmed_at BIGINT"
+                ))
 
     def close(self):
         self.engine.dispose()
@@ -233,8 +242,10 @@ class Store:
 
         return dict(row._mapping) if row is not None else None
 
-    def save_candles(self, symbol, interval, candles):
+    def save_candles(self, symbol, interval, candles, *, confirmed_at=None):
         """Upsert candle dictionaries in one transaction, including open candles."""
+        if confirmed_at is not None and (type(confirmed_at) is not int or confirmed_at < 0):
+            raise ValueError("confirmed_at must be a nonnegative UTC timestamp")
         fields = (
             "time", "open", "high", "low", "close", "volume", "close_time"
         )
@@ -243,6 +254,10 @@ class Store:
                 **{field: candle[field] for field in fields},
                 "symbol": symbol,
                 "interval": interval,
+                "confirmed_at": (
+                    confirmed_at if confirmed_at is not None
+                    and candle["close_time"] < confirmed_at else None
+                ),
             }
             for candle in candles
         ]
@@ -263,26 +278,34 @@ class Store:
                     index_elements=["symbol", "interval", "time"],
                     set_={
                         field: statement.excluded[field]
-                        for field in fields
+                        for field in (*fields, "confirmed_at")
                         if field != "time"
                     },
+                    # A stale/unconfirmed write cannot replace a final snapshot.
+                    where=or_(
+                        market_candles.c.confirmed_at.is_(None),
+                        statement.excluded.confirmed_at >= market_candles.c.confirmed_at,
+                    ),
                 ),
                 values,
             )
 
-    def get_candles(self, symbol, interval, limit=200):
+    def get_candles(self, symbol, interval, limit=200, *, confirmed_only=False):
         """Return the latest candles in chronological order, or an empty list."""
         if not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer between 1 and 1000")
 
         c = market_candles.c
+        columns = [c.time, c.open, c.high, c.low, c.close, c.volume, c.close_time]
+        where = [c.symbol == symbol, c.interval == interval]
+        if confirmed_only:
+            columns.append(c.confirmed_at)
+            where.extend([c.confirmed_at.is_not(None), c.close_time < c.confirmed_at])
 
         with self.engine.connect() as conn:
             rows = conn.execute(
-                select(
-                    c.time, c.open, c.high, c.low, c.close, c.volume, c.close_time
-                )
-                .where(c.symbol == symbol, c.interval == interval)
+                select(*columns)
+                .where(*where)
                 .order_by(c.time.desc())
                 .limit(limit)
             ).all()

@@ -2,12 +2,13 @@
 import asyncio
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, event
+from sqlalchemy.exc import SQLAlchemyError
 
 from app import service as service_module
 from app.market import INTERVALS, MarketError
 from app.service import ForecastService, SYMBOLS
-from app.storage import Store, market_candles
+from app.storage import Store, market_candles, market_quotes
 from test_strategy_storage import record
 
 
@@ -105,6 +106,57 @@ def test_cycle_collects_501_and_publishes_both_pairs_without_affecting_legacy(en
     assert len([c for c in market.calls if c[0] == 'klines' and c[2:4] == ('1h', 501)]) == 2
     assert len([c for c in market.calls if c[0] == 'klines' and c[2] == '1m']) == 2  # legacy only
     assert service.active_symbol == 'SOLUSDT'
+
+
+@pytest.mark.parametrize('failed_symbol', SYMBOLS)
+def test_quote_database_error_rolls_back_and_other_pair_still_updates(env, caplog, failed_symbol):
+    clock, store, market, service = env
+    healthy_symbol = next(symbol for symbol in SYMBOLS if symbol != failed_symbol)
+    original = dict(symbol=failed_symbol, price=77., change_pct=0., high=78., low=76.,
+                    volume=10., updated_at=clock['now']-1000, fetched_at=clock['now']-1000)
+    store.save_quote(original)
+    failed_connection = []
+    rolled_back = []
+
+    def fail_after_quote_write(conn, cursor, statement, parameters, context, executemany):
+        if (context.isinsert and context.compiled.statement.table is market_quotes
+                and context.compiled_parameters[0]['symbol'] == failed_symbol):
+            failed_connection.append(conn)
+            # The real upsert has run; engine.begin() must roll it back.
+            raise SQLAlchemyError('simulated quote transaction failure')
+
+    def record_rollback(conn):
+        if failed_connection and conn is failed_connection[-1]:
+            rolled_back.append(conn)
+
+    event.listen(store.engine, 'after_cursor_execute', fail_after_quote_write)
+    event.listen(store.engine, 'rollback', record_rollback)
+    try:
+        with caplog.at_level('ERROR', logger='app.service'):
+            run(service.cycle())
+    finally:
+        event.remove(store.engine, 'after_cursor_execute', fail_after_quote_write)
+        event.remove(store.engine, 'rollback', record_rollback)
+
+    key = f'{failed_symbol}:quote'
+    assert failed_connection and rolled_back
+    assert store.get_quote(failed_symbol) == original
+    assert store.get_quote(healthy_symbol)['price'] == 99999.
+    assert [call[1] for call in market.calls if call[0] == 'ticker'] == list(SYMBOLS)
+    for interval, count in (('15m', 200), ('1h', 501), ('4h', 200)):
+        assert len(store.get_candles(healthy_symbol, interval, count)) == count
+    assert len(rows(store, healthy_symbol)) == 6
+    assert len(store.latest(healthy_symbol)) == 3
+    assert service.last_cycle_at == clock['now']
+    assert 'SQLAlchemyError' in service.errors[key]
+    assert 'simulated quote transaction failure' in service.errors[key]
+    assert any(key in record.getMessage() and record.exc_info for record in caplog.records)
+
+    # A successful next attempt clears the error through the existing path.
+    clock['now'] += 120_000
+    run(service.cycle())
+    assert store.get_quote(failed_symbol)['price'] == 99999.
+    assert key not in service.errors
 
 
 def test_repeated_cycles_and_restart_do_not_duplicate_or_recalculate_release(env, monkeypatch):

@@ -117,7 +117,7 @@ function updateQuote(ticker) {
       ticker.change_pct >= 0 ? 'positive' : 'negative';
 
     $('updated').textContent =
-      'Price · ' + timeText(ticker.updated_at);
+      (ticker.stale ? 'Stale price · ' : 'Price · ') + dateText(ticker.updated_at);
   }
 }
 
@@ -195,7 +195,7 @@ function renderForecasts(data) {
             : 'Watching';
 
       const stale =
-        Date.now() - p.issued_at > 17 * 60000;
+        Date.now() - p.issued_at > 70 * 60000;
 
       const status =
         Date.now() >= p.due_at
@@ -424,8 +424,8 @@ function renderStatus(data) {
       : data.render_free
         ? (
             "On Render's free tier the server may sleep. " +
-            'After waking, saved forecasts are evaluated; ' +
-            'missed forecasts are not backfilled.'
+            'An independent hourly Cron collects data and evaluates forecasts ' +
+            'even while the website sleeps. Missed LIVE forecasts are not backfilled.'
           )
         : '';
 
@@ -470,7 +470,11 @@ async function refreshAll() {
         state.lastChartKey = chartKey;
         state.marketGood = true;
 
-        $('chart-message').classList.add('hidden');
+        state.errors.stale = data.stale
+          ? 'Showing the last saved data. It is stale or not yet confirmed; waiting for the next Cron update.'
+          : '';
+        $('chart-message').textContent = state.errors.stale;
+        $('chart-message').classList.toggle('hidden', !data.stale);
       }
     ],
 

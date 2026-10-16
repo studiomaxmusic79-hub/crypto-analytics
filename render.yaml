@@ -1,5 +1,5 @@
-# Creates only a free web service. Supply your existing free PostgreSQL connection.
-# No database, paid worker, cron or persistent disk is provisioned by this file.
+# Free web reader plus one paid, finite hourly cron. Neon is external.
+# Set the existing web DATABASE_URL secret; cron references the same value.
 services:
   - type: web
     name: krypta-analytics
@@ -14,3 +14,20 @@ services:
         value: 3.12.14
       - key: DATABASE_URL
         sync: false
+
+  - type: cron
+    name: krypta-market-tick
+    runtime: python
+    plan: 0.5c-512mb
+    region: frankfurt
+    schedule: "1 * * * *" # HH:01 UTC; late runs never backfill Krypta LIVE.
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.jobs.market_tick
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: DATABASE_URL
+        fromService:
+          type: web
+          name: krypta-analytics
+          envVarKey: DATABASE_URL

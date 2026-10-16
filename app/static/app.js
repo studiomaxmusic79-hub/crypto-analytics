@@ -128,7 +128,7 @@ function updateQuote(ticker) {
         : 'negative';
 
     $('updated').textContent =
-      'Цена · ' + timeText(ticker.updated_at);
+      (ticker.stale ? 'Устаревшая цена · ' : 'Цена · ') + dateText(ticker.updated_at);
   }
 }
 
@@ -222,7 +222,7 @@ function renderForecasts(data) {
 
       const stale =
         Date.now() - p.issued_at >
-        17 * 60000;
+        70 * 60000;
 
       const status =
         Date.now() >= p.due_at
@@ -498,9 +498,9 @@ function renderStatus(data) {
       : data.render_free
         ? (
             'На бесплатном Render сервер может засыпать. ' +
-            'После пробуждения результаты сохранённых ' +
-            'прогнозов будут проверены; пропущенные ' +
-            'прогнозы не добавляются задним числом.'
+            'Сбор данных и проверка прогнозов выполняются ' +
+            'отдельным часовым Cron независимо от сна сайта. ' +
+            'Пропущенные LIVE-прогнозы не добавляются задним числом.'
           )
         : '';
 
@@ -541,8 +541,8 @@ async function refreshAll() {
 
     Они удалены.
 
-    Теперь Binance получает рыночный запрос
-    только для выбранной пользователем валюты.
+    API читает общие данные Neon для выбранной валюты.
+    Посещение сайта не запускает запросы Binance.
   */
   const tasks = [
     [
@@ -564,9 +564,11 @@ async function refreshAll() {
         state.marketGood =
           true;
 
-        $('chart-message').classList.add(
-          'hidden'
-        );
+        state.errors.stale = data.stale
+          ? 'Показаны последние сохранённые данные. Они устарели или ещё не подтверждены; ожидается обновление Cron.'
+          : '';
+        $('chart-message').textContent = state.errors.stale;
+        $('chart-message').classList.toggle('hidden', !data.stale);
       }
     ],
 

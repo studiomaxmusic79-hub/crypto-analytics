@@ -3,7 +3,7 @@ import csv
 import io
 import os
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -15,15 +15,15 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
-from .market import BinanceMarket, MarketError
-from .service import CANDLE_REFRESH_MS, ForecastService
+from .market import INTERVALS, MarketError
+from .service import SYMBOLS
 from .storage import Store
 
 
 STATIC = Path(__file__).parent / "static"
 Symbol = str
-QUOTE_MAX_AGE_MS = 6 * 60_000
-CANDLE_GRACE_MS = 4 * 60_000
+# Hourly cron plus ten minutes for startup, network delay and a short retry.
+MARKET_MAX_AGE_MS = 70 * 60_000
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -62,57 +62,27 @@ def stored_quote(store: Store, symbol: str):
         )
 
     now = int(time.time() * 1000)
-    if (
-        now - ticker["fetched_at"] > QUOTE_MAX_AGE_MS
-        or now - ticker["updated_at"] > QUOTE_MAX_AGE_MS + 120_000
-    ):
-        raise HTTPException(
-            503,
-            f"Сохранённая котировка {symbol} устарела. "
-            "Ожидается фоновое обновление данных."
-        )
+    stale = (
+        now - ticker["fetched_at"] > MARKET_MAX_AGE_MS
+        or now - ticker["updated_at"] > MARKET_MAX_AGE_MS + 120_000
+        or ticker["fetched_at"] > now + 60_000
+    )
 
-    # Сохраняем прежний формат ticker(), без служебного fetched_at.
-    return {
-        key: ticker[key]
-        for key in (
-            "symbol", "price", "change_pct", "high", "low", "volume", "updated_at"
-        )
-    }
+    # Preserve all original fields; expose age without hiding saved data.
+    return {**{key: ticker[key] for key in (
+        "symbol", "price", "change_pct", "high", "low", "volume", "updated_at"
+    )}, "stale": stale, "fetched_at": ticker["fetched_at"]}
 
 
 @asynccontextmanager
 async def lifespan(app):
     store = Store()
-    await asyncio.to_thread(store.init)
-
-    market = BinanceMarket()
-    service = ForecastService(
-        market,
-        store
-    )
-
-    app.state.store = store
-    app.state.market = market
-    app.state.service = service
-
-    task = asyncio.create_task(
-        service.run()
-    )
-
     try:
+        await asyncio.to_thread(store.init)
+        app.state.store = store
         yield
-
     finally:
-        task.cancel()
-
-        with suppress(
-            asyncio.CancelledError
-        ):
-            await task
-
-        await market.close()
-        store.close()
+        await asyncio.to_thread(store.close)
 
 
 app = FastAPI(
@@ -217,20 +187,25 @@ def health(
 def status(
     request: Request
 ):
-    service = request.app.state.service
+    quotes = [request.app.state.store.get_quote(symbol) for symbol in SYMBOLS]
 
     return {
         "now":
             int(time.time() * 1000),
 
         "last_cycle_at":
-            service.last_cycle_at,
+            None,  # No in-process collector; a quote update is not a full cycle.
 
         "active_symbol":
-            service.active_symbol,
+            None,
 
         "errors":
-            dict(service.errors),
+            {},  # Detailed job failures are recorded in the cron run logs.
+
+        "collector": "render-cron",
+        "last_market_update_at": max(
+            (quote["fetched_at"] for quote in quotes if quote is not None), default=None
+        ),
 
         "storage":
             request.app.state
@@ -246,7 +221,7 @@ def status(
             "Binance public market data",
 
         "generation_interval_minutes":
-            15,
+            60,
 
         "calibrated_probability":
             False
@@ -266,11 +241,10 @@ def market(
     symbol = normalize_symbol(symbol)
     store = request.app.state.store
     ticker = stored_quote(store, symbol)
-    candles = store.get_candles(
-        symbol,
-        interval,
-        limit=200
-    )
+    confirmed = store.get_candles(symbol, interval, limit=200, confirmed_only=True)
+    # Before the first post-migration collection, retain old snapshots but label
+    # them explicitly unconfirmed/stale. Elapsed wall time cannot certify them.
+    candles = confirmed or store.get_candles(symbol, interval, limit=200)
 
     if not candles:
         raise HTTPException(
@@ -280,24 +254,24 @@ def market(
         )
 
     now = int(time.time() * 1000)
-    updated_at = request.app.state.service.candle_updates.get((symbol, interval))
-    max_age = CANDLE_REFRESH_MS[interval] + CANDLE_GRACE_MS
-    if (
-        updated_at is None
-        or now - updated_at > max_age
-        or now - candles[-1]["close_time"] > max_age
-    ):
-        raise HTTPException(
-            503,
-            f"Свечи {symbol} ({interval}) устарели или ещё не подтверждены "
-            "после запуска. Ожидается фоновое обновление данных."
-        )
+    confirmed_at = confirmed[-1]["confirmed_at"] if confirmed else None
+    last_close_at = confirmed[-1]["close_time"] + 1 if confirmed else None
+    candles_stale = (
+        not confirmed
+        or now - confirmed_at > MARKET_MAX_AGE_MS
+        or confirmed_at > now + 60_000
+        or last_close_at < (now - MARKET_MAX_AGE_MS) // INTERVALS[interval] * INTERVALS[interval]
+    )
 
     return {
         "ticker": ticker,
         "interval": interval,
         "source": "Binance",
-        "candles": candles
+        "candles": [{k: v for k, v in c.items() if k != "confirmed_at"} for c in candles],
+        "stale": bool(ticker["stale"] or candles_stale),
+        "candles_stale": bool(candles_stale),
+        "candles_confirmed_at": confirmed_at,
+        "last_closed_at": last_close_at,
     }
 
 

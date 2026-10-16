@@ -1,0 +1,1 @@
+"""Standalone, finite application jobs."""

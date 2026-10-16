@@ -1,11 +1,15 @@
 import asyncio
+import logging
 import time
 
+from sqlalchemy.exc import SQLAlchemyError
+
+from . import krypta_strategy
 from .analytics import analyze, evaluate
 from .market import INTERVALS, MarketError
 from .strategies import (
     HOUR_MS, MIN_BARS, STRATEGY_A, STRATEGY_B, VERSION,
-    analyze_strategies, evaluate_result,
+    analyze_strategies, evaluate_result, evaluation_thresholds,
 )
 
 
@@ -19,12 +23,15 @@ HISTORY_BARS = 200
 STRATEGY_HISTORY_BARS = MIN_BARS + 1
 LIVE_WINDOW_MS = 5 * 60_000
 EVALUATION_VERSION = "hourly-flat-v1"
+logger = logging.getLogger(__name__)
 
 
 class ForecastService:
-    def __init__(self, market, store):
+    def __init__(self, market, store, *, enable_krypta=False):
         self.market = market
         self.store = store
+        # Only the standalone market_tick opts in; FastAPI keeps its old cycle.
+        self.enable_krypta = enable_krypta
         self.last_cycle_at = None
         self.errors = {}
 
@@ -84,6 +91,8 @@ class ForecastService:
             return
 
         history_bars = STRATEGY_HISTORY_BARS if interval == "1h" else HISTORY_BARS
+        if self.enable_krypta:
+            history_bars = max(history_bars, krypta_strategy.WINDOW_BARS[interval] + 1)
         stored = await asyncio.to_thread(
             self.store.get_candles, symbol, interval, history_bars
         )
@@ -138,9 +147,102 @@ class ForecastService:
         if not usable(values, limit):
             raise MarketError("Неполная или устаревшая история свечей")
 
-        await asyncio.to_thread(self.store.save_candles, symbol, interval, values)
+        await asyncio.to_thread(
+            self.store.save_candles, symbol, interval, values, confirmed_at=now
+        )
         self.collected_slots[key] = refresh_slot
         self.candle_updates[key] = now
+
+    async def generate_krypta(self, symbol, now):
+        """Publish one immutable MTF decision, with the existing 1h/4h checks."""
+        reference = now // HOUR_MS * HOUR_MS
+
+        def in_live_window():
+            # The actual issue time is exclusive of HH:05, unlike old engines.
+            return 0 <= int(time.time() * 1000) - reference < LIVE_WINDOW_MS
+
+        if not in_live_window():
+            logger.info("Krypta %s: outside LIVE window for %s", symbol, reference)
+            return
+
+        existing = await asyncio.to_thread(lambda: [
+            self.store.has_strategy_forecast(
+                symbol, reference, krypta_strategy.STRATEGY_ID,
+                krypta_strategy.STRATEGY_VERSION, horizon,
+            ) for horizon in (1, 4)
+        ])
+        if all(existing):
+            return
+        if any(existing):
+            raise MarketError("Krypta: incomplete published release; overwrite forbidden")
+
+        inputs = {}
+        confirmations = {}
+        for interval, count in krypta_strategy.WINDOW_BARS.items():
+            expected_close = reference // INTERVALS[interval] * INTERVALS[interval]
+            confirmed_at = self.candle_updates.get((symbol, interval))
+            if confirmed_at is None or not expected_close <= confirmed_at <= now:
+                raise MarketError(f"Krypta: {symbol} {interval} close is not confirmed")
+            saved = await asyncio.to_thread(
+                self.store.get_candles, symbol, interval, max(HISTORY_BARS, count + 1)
+            )
+            inputs[interval] = [c for c in saved if c["close_time"] < reference]
+            confirmations[interval] = confirmed_at
+
+        # Identify the actual hourly input rather than backfilling an older hour.
+        hourly = inputs["1h"]
+        if not hourly or hourly[-1]["close_time"] + 1 != reference:
+            raise MarketError("Krypta: latest closed hourly candle is unavailable")
+        try:
+            result = krypta_strategy.analyze(inputs, reference_time=reference)
+        except Exception as exc:
+            logger.exception("Krypta calculation failed for %s", symbol)
+            raise MarketError(f"Krypta calculation failed: {type(exc).__name__}") from exc
+        if result["status"] != "OK" or result["signal"] not in ("UP", "DOWN", "WAIT"):
+            logger.warning(
+                "Krypta %s: %s; %s", symbol, result["status"], result["reason_codes"]
+            )
+            raise MarketError(
+                f"Krypta: {result['status']}: " + ", ".join(result["reason_codes"])
+            )
+
+        # Reuse the project's frozen FLAT rules, not a second evaluation formula.
+        thresholds = evaluation_thresholds(
+            result["base_price"], result["indicators"]["1h"]["atr14"]
+        )
+        diagnostics = {
+            **result, "score_source": "T1h", "confirmed_at": confirmations,
+        }
+        def publish():
+            # Sample in the writing thread, after reads, analysis and queueing.
+            issued_at = int(time.time() * 1000)
+            if not 0 <= issued_at - reference < LIVE_WINDOW_MS:
+                logger.info("Krypta %s: LIVE window expired before publication", symbol)
+                return
+            if abs(issued_at - now) > 60_000:
+                raise MarketError("Krypta: server and Binance clocks are not synchronized")
+            records = [{
+                "symbol": symbol,
+                "strategy_id": result["strategy_id"],
+                "strategy_version": result["strategy_version"],
+                "input_close_at": reference,
+                "horizon": horizon,
+                "issued_at": issued_at,
+                "base_price": result["base_price"],
+                "due_at": reference + horizon * HOUR_MS,
+                "status": "OK",
+                "direction": result["signal"],
+                # Required by the schema: raw trend factor, not confidence.
+                "score": result["T1h"],
+                "reason_codes": result["reason_codes"],
+                "indicators": diagnostics,
+                "evaluation_version": EVALUATION_VERSION,
+                "neutral_pct": thresholds[horizon],
+            } for horizon in (1, 4)]
+            self.store.save_strategy_forecasts(records)
+            logger.info("Krypta %s: LIVE %s at %s", symbol, result["signal"], issued_at)
+
+        await asyncio.to_thread(publish)
 
     async def generate_strategies(self, symbol, now):
         input_close_at = now // HOUR_MS * HOUR_MS
@@ -247,7 +349,7 @@ class ForecastService:
                             candle = None
                         if candle is not None:
                             await asyncio.to_thread(
-                                self.store.save_candles, symbol, "1h", [candle]
+                                self.store.save_candles, symbol, "1h", [candle], confirmed_at=now
                             )
                         # This confirms only the exact target, not the whole
                         # hourly window or any currently forming input candle.
@@ -344,7 +446,7 @@ class ForecastService:
         # Формирующуюся минутную свечу не сохраняем: её незавершённая
         # цена не должна позже использоваться как результат прогноза.
         await asyncio.to_thread(
-            self.store.save_candles, symbol, "1m", self.candle_values(closed)
+            self.store.save_candles, symbol, "1m", self.candle_values(closed), confirmed_at=now
         )
 
         inputs = {}
@@ -516,12 +618,19 @@ class ForecastService:
                 (f"{symbol}:strategies", self.generate_strategies, (symbol, now)),
                 (symbol, self.generate, (symbol, now)),
             ]
+            if self.enable_krypta:
+                # Inputs have been saved; issue before slower legacy generation.
+                jobs.insert(-2, (f"{symbol}:krypta", self.generate_krypta, (symbol, now)))
             for key, operation, args in jobs:
                 try:
                     await operation(*args)
                     self.errors.pop(key, None)
                 except (MarketError, ValueError) as exc:
                     self.errors[key] = str(exc)
+                except SQLAlchemyError as exc:
+                    # Store's transaction context has already rolled back.
+                    self.errors[key] = f"{type(exc).__name__}: {exc}"
+                    logger.exception("Database operation failed: %s", key)
 
         self.errors.pop(
             "evaluation",

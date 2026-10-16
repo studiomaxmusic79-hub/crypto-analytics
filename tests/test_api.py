@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 from app.main import app
 from app.service import ForecastService
+from app.market import BinanceMarket
 from test_storage import record
 import time
 
@@ -41,25 +42,28 @@ def test_visitor_market_apis_only_read_shared_data_and_never_switch_collector(tm
         async def forbidden(*args, **kwargs):
             calls.append((args,kwargs))
             raise AssertionError('visitor must not call Binance')
-        monkeypatch.setattr(client.app.state.market,'ticker',forbidden)
-        monkeypatch.setattr(client.app.state.market,'klines',forbidden)
-        client.app.state.service.active_symbol = 'ETHUSDT'
+        monkeypatch.setattr(BinanceMarket,'ticker',forbidden)
+        monkeypatch.setattr(BinanceMarket,'klines',forbidden)
+        assert not hasattr(client.app.state, 'market')
+        assert not hasattr(client.app.state, 'service')
         assert client.get('/api/quote').status_code == 503
         assert client.get('/api/market').status_code == 503
         now = int(time.time()*1000)
         start = now//3_600_000*3_600_000
         quote = dict(symbol='BTCUSDT',price=100.,change_pct=1.,high=101.,low=99.,
                      volume=100.,updated_at=now,fetched_at=now)
-        candle = dict(time=start,open=100.,high=101.,low=99.,close=100.,volume=10.,
-                      close_time=start+3_600_000-1)
+        candle = dict(time=start-3_600_000,open=100.,high=101.,low=99.,close=100.,volume=10.,
+                      close_time=start-1)
         client.app.state.store.save_quote(quote)
-        client.app.state.store.save_candles('BTCUSDT','1h',[candle])
-        client.app.state.service.candle_updates[('BTCUSDT','1h')] = now
-        expected = {key:value for key,value in quote.items() if key != 'fetched_at'}
+        client.app.state.store.save_candles('BTCUSDT','1h',[candle], confirmed_at=now)
+        expected = {**quote, 'stale':False}
         assert client.get('/api/quote').json() == expected
-        assert client.get('/api/market').json() == dict(ticker=expected,interval='1h',source='Binance',candles=[candle])
+        assert client.get('/api/market').json() == dict(
+            ticker=expected,interval='1h',source='Binance',candles=[candle], stale=False,
+            candles_stale=False,candles_confirmed_at=now,last_closed_at=start,
+        )
         assert client.get('/api/forecasts').status_code == 200
-        assert client.app.state.service.active_symbol == 'ETHUSDT'
+        assert not hasattr(client.app.state, 'service')
         assert calls == []
 
 
@@ -77,8 +81,7 @@ def test_strategy_forecasts_reads_latest_database_rows_without_binance(tmp_path,
             calls.append((args,kwargs))
             raise AssertionError('strategy API must never call Binance')
         for method in ('ticker','klines','time_ms','target_price'):
-            monkeypatch.setattr(client.app.state.market,method,forbidden)
-        client.app.state.service.active_symbol = 'ETHUSDT'
+            monkeypatch.setattr(BinanceMarket,method,forbidden)
         store = client.app.state.store
         history_calls = []
         original = store.strategy_history
@@ -121,6 +124,6 @@ def test_strategy_forecasts_reads_latest_database_rows_without_binance(tmp_path,
         assert client.get('/api/strategy-forecasts?symbol=BAD').status_code == 400
         assert client.post('/api/strategy-forecasts',json={}).status_code == 405
         assert client.get('/api/forecasts').json() == {'items':[]}
-        assert client.app.state.service.active_symbol == 'ETHUSDT'
+        assert not hasattr(client.app.state, 'service')
         assert calls == []
         assert store.strategy_history('BTCUSDT')['total'] == 18
