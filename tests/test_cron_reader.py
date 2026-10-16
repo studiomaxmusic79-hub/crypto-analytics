@@ -169,6 +169,7 @@ def test_init_migrates_existing_candles_without_certifying_or_losing_them(tmp_pa
     assert len(store.latest("BTCUSDT")) == 1
     assert set(inspect(store.engine).get_table_names()) == {
         "forecasts", "strategy_forecasts", "market_quotes", "market_candles",
+        "market_candle_revisions", "market_data_state",
     }
     store.close()
 
@@ -196,26 +197,36 @@ def test_confirmation_upsert_compiles_for_both_databases(dialect):
     store = object.__new__(Store)
     store.engine = MagicMock()
     store.engine.dialect.name = dialect.name
-    conn = store.engine.begin.return_value.__enter__.return_value
+    conn = store.engine.connect.return_value.__enter__.return_value
+    conn.dialect.name = dialect.name
+    conn.execute.return_value.mappings.return_value = []
+    conn.execute.return_value.scalar_one.return_value = 1
     store.save_candles("BTCUSDT", "1h", [candle()], confirmed_at=NOW)
     statement, values = conn.execute.call_args.args
     sql = str(statement.compile(dialect=dialect))
-    assert "ON CONFLICT" in sql and "confirmed_at" in sql and "WHERE" in sql
+    assert "ON CONFLICT" in sql and "confirmed_at" in sql and "observation_id" in sql
     assert values[0]["confirmed_at"] == NOW
+    if dialect.name == "postgresql":
+        assert "pg_advisory_xact_lock" in str(conn.execute.call_args_list[0].args[0])
+    else:
+        conn.exec_driver_sql.assert_called_once_with("BEGIN IMMEDIATE")
 
 
 def test_postgres_column_migration_is_repeatable(monkeypatch):
     store = object.__new__(Store)
     store.engine = MagicMock()
-    conn = store.engine.begin.return_value.__enter__.return_value
+    conn = store.engine.connect.return_value.__enter__.return_value
     conn.dialect.name = "postgresql"
     monkeypatch.setattr(storage_module.metadata, "create_all", lambda engine: None)
     mocked_inspector = MagicMock()
     mocked_inspector.get_columns.return_value = [{"name": "close_time"}]
     monkeypatch.setattr(storage_module, "inspect", lambda connection: mocked_inspector)
     store.init()
-    sql = str(conn.execute.call_args.args[0])
-    assert sql == "ALTER TABLE market_candles ADD COLUMN IF NOT EXISTS confirmed_at BIGINT"
+    statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert "ALTER TABLE market_candles ADD COLUMN IF NOT EXISTS confirmed_at BIGINT" in statements
+    assert "ALTER TABLE market_candles ADD COLUMN IF NOT EXISTS observation_id BIGINT" in statements
+    assert "ALTER TABLE strategy_forecasts ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMP WITH TIME ZONE" in statements
+    assert "pg_advisory_xact_lock" in statements[0]
 
 
 def test_next_successful_hour_restores_data_and_checks_only_real_forecasts(tmp_path, monkeypatch):

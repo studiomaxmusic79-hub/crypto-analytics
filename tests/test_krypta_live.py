@@ -215,13 +215,14 @@ def test_technical_results_are_not_persisted_as_wait(live, monkeypatch, kind, ca
         run(service.collect_candles("BTCUSDT", interval, clock["now"]))
     if kind == "missing":
         # Keep valid latest candles/confirmation but remove a warm-up candle.
-        original = store.get_candles
+        original = store.strategy_inputs
 
-        def missing(symbol, interval, limit=200):
-            saved = original(symbol, interval, limit)
-            return saved[1:] if interval == "4h" else saved
+        def missing(symbol, reference_time, windows):
+            snapshot = original(symbol, reference_time, windows)
+            snapshot["candles"]["4h"] = snapshot["candles"]["4h"][1:]
+            return snapshot
 
-        monkeypatch.setattr(store, "get_candles", missing)
+        monkeypatch.setattr(store, "strategy_inputs", missing)
         expected = "DATA_UNAVAILABLE: INSUFFICIENT_HISTORY"
     else:
         saved = store.get_candles("BTCUSDT", "15m", 200)

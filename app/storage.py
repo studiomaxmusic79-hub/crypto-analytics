@@ -1,15 +1,17 @@
 import json
 import math
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, BigInteger,
-    String, Float, Text, Boolean, UniqueConstraint, CheckConstraint,
-    select, func, case, and_, or_, inspect, text
+    String, Float, Text, Boolean, DateTime, UniqueConstraint, CheckConstraint,
+    select, func, case, and_, or_, inspect, text, union_all
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
+from .market_inputs import NUMERIC_FIELDS, numeric_values
 
 metadata = MetaData()
 
@@ -74,6 +76,28 @@ market_candles = Table(
     Column("close_time", BigInteger, nullable=False),
     # Set only by a successful collection made after this candle closed.
     Column("confirmed_at", BigInteger),
+    Column("observation_id", BigInteger),
+    Column("observed_at", DateTime(timezone=True)),
+    # Exact normalized decimals; existing Float columns remain API-compatible.
+    Column("numeric_values", Text),
+)
+
+
+market_candle_revisions = Table(
+    "market_candle_revisions", metadata,
+    Column("observation_id", BigInteger, primary_key=True, autoincrement=False),
+    *[Column(c.name, c.type, nullable=c.nullable)
+      for c in market_candles.c if c.name != "observation_id"],
+)
+
+# One transactional, global monotonic allocator and the honest migration boundary.
+# A legacy candle is NOT an observation until accepted again after this boundary.
+market_data_state = Table(
+    "market_data_state", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("last_observation_id", BigInteger, nullable=False),
+    Column("revision_tracking_started_at", DateTime(timezone=True), nullable=False,
+           server_default=func.current_timestamp()),
 )
 
 
@@ -109,6 +133,10 @@ strategy_forecasts = Table(
     Column("evaluated_at", BigInteger),
     Column("evaluation_note", Text),
     Column("last_attempt_at", BigInteger),
+    Column("input_data_cutoff_id", BigInteger),
+    Column("input_hash", String(64)),
+    Column("recorded_at", DateTime(timezone=True),
+           server_default=func.current_timestamp()),
     UniqueConstraint(*STRATEGY_FORECAST_KEY, name="unique_strategy_forecast"),
     CheckConstraint("horizon IN (1, 4)", name="strategy_horizon"),
     CheckConstraint(
@@ -194,14 +222,54 @@ class Store:
         )
 
     def init(self):
-        metadata.create_all(self.engine)
         # create_all does not add columns to an existing Neon/SQLite table.
-        with self.engine.begin() as conn:
-            if "confirmed_at" not in {c["name"] for c in inspect(conn).get_columns("market_candles")}:
-                optional = " IF NOT EXISTS" if conn.dialect.name == "postgresql" else ""
-                conn.execute(text(
-                    f"ALTER TABLE market_candles ADD COLUMN{optional} confirmed_at BIGINT"
-                ))
+        with self._candle_transaction() as conn:
+            metadata.create_all(conn)
+            postgres = conn.dialect.name == "postgresql"
+            optional = " IF NOT EXISTS" if postgres else ""
+            for table, additions in (
+                ("market_candles", {"confirmed_at": "BIGINT", "observation_id": "BIGINT",
+                                    "observed_at": "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME",
+                                    "numeric_values": "TEXT"}),
+                ("strategy_forecasts", {"input_data_cutoff_id": "BIGINT", "input_hash": "VARCHAR(64)",
+                                        "recorded_at": "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME"}),
+            ):
+                existing = {c["name"] for c in inspect(conn).get_columns(table)}
+                for name, kind in additions.items():
+                    if name not in existing:
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN{optional} {name} {kind}"))
+            # No fake timestamps on old forecasts. Only subsequent inserts get DB time.
+            if postgres:
+                conn.execute(text("ALTER TABLE strategy_forecasts ALTER COLUMN recorded_at "
+                                  "SET DEFAULT CURRENT_TIMESTAMP"))
+            else:
+                conn.execute(text("""CREATE TRIGGER IF NOT EXISTS strategy_recorded_at
+                    AFTER INSERT ON strategy_forecasts WHEN NEW.recorded_at IS NULL
+                    BEGIN UPDATE strategy_forecasts SET recorded_at = CURRENT_TIMESTAMP
+                    WHERE id = NEW.id; END"""))
+            insert = pg_insert if postgres else sqlite_insert
+            conn.execute(insert(market_data_state).values(id=1, last_observation_id=0)
+                         .on_conflict_do_nothing(index_elements=["id"]))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS market_candle_observation "
+                              "ON market_candles (observation_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS market_revision_key "
+                              "ON market_candle_revisions (symbol, interval, time, observation_id)"))
+
+    @contextmanager
+    def _candle_transaction(self):
+        """Serialize only DB candle writes/snapshots, also across manual jobs.
+
+        Same lock on every writer; allocation, archival and commit order cannot
+        invert. No network or strategy calculation is inside this section.
+        SQLite BEGIN IMMEDIATE provides the equivalent single writer boundary.
+        """
+        with self.engine.connect() as conn:
+            with conn.begin():
+                if conn.dialect.name == "postgresql":
+                    conn.execute(text("SELECT pg_advisory_xact_lock(634729180214)"))
+                else:
+                    conn.exec_driver_sql("BEGIN IMMEDIATE")
+                yield conn
 
     def close(self):
         self.engine.dispose()
@@ -243,52 +311,118 @@ class Store:
         return dict(row._mapping) if row is not None else None
 
     def save_candles(self, symbol, interval, candles, *, confirmed_at=None):
-        """Upsert candle dictionaries in one transaction, including open candles."""
+        """Update current bars; archive only changed accepted confirmed versions."""
         if confirmed_at is not None and (type(confirmed_at) is not int or confirmed_at < 0):
             raise ValueError("confirmed_at must be a nonnegative UTC timestamp")
-        fields = (
-            "time", "open", "high", "low", "close", "volume", "close_time"
-        )
-        values = [
-            {
-                **{field: candle[field] for field in fields},
-                "symbol": symbol,
-                "interval": interval,
-                "confirmed_at": (
-                    confirmed_at if confirmed_at is not None
-                    and candle["close_time"] < confirmed_at else None
-                ),
-            }
-            for candle in candles
-        ]
-
-        if not values:
+        if not candles:
             return
-
-        insert = (
-            sqlite_insert
-            if self.engine.dialect.name == "sqlite"
-            else pg_insert
-        )
-        statement = insert(market_candles)
-
-        with self.engine.begin() as conn:
-            conn.execute(
-                statement.on_conflict_do_update(
+        c = market_candles.c
+        with self._candle_transaction() as conn:
+            previous = {r["time"]: dict(r) for r in conn.execute(
+                select(market_candles).where(c.symbol == symbol, c.interval == interval,
+                                            c.time.in_([bar["time"] for bar in candles]))
+            ).mappings()}
+            accepted, archived, new_versions = {}, [], []
+            for candle in candles:
+                start, close_time = candle["time"], candle["close_time"]
+                if type(start) is not int or type(close_time) is not int:
+                    raise ValueError("Candle times must be integer UTC milliseconds")
+                if start in accepted:
+                    raise ValueError("Duplicate candle key in one response")
+                old = previous.get(start)
+                confirmation = confirmed_at if confirmed_at is not None and close_time < confirmed_at else None
+                if old and old["confirmed_at"] is not None and (
+                    confirmation is None or confirmation < old["confirmed_at"]
+                ):
+                    continue
+                numbers = numeric_values(candle)
+                encoded = json.dumps(numbers, sort_keys=True, separators=(",", ":"))
+                old_numbers = (json.loads(old["numeric_values"]) if old and old["numeric_values"]
+                               else numeric_values(old) if old else None)
+                unchanged = old and old_numbers == numbers and old["close_time"] == close_time
+                values = dict(symbol=symbol, interval=interval, time=start,
+                              close_time=close_time, confirmed_at=confirmation,
+                              numeric_values=encoded, observation_id=None, observed_at=None,
+                              **{f: float(numbers[f]) for f in NUMERIC_FIELDS})
+                if confirmation is not None:
+                    if old and old["observation_id"] is not None and unchanged:
+                        values["observation_id"] = old["observation_id"]
+                        values["observed_at"] = old["observed_at"]
+                    else:
+                        if old and old["observation_id"] is not None:
+                            archived.append(old)
+                        new_versions.append(values)
+                accepted[start] = values
+            if new_versions:
+                last = conn.execute(market_data_state.update().where(market_data_state.c.id == 1)
+                                    .values(last_observation_id=market_data_state.c.last_observation_id + len(new_versions))
+                                    .returning(market_data_state.c.last_observation_id)).scalar_one()
+                observed = conn.scalar(select(func.clock_timestamp() if conn.dialect.name == "postgresql"
+                                              else func.current_timestamp()))
+                for offset, values in enumerate(new_versions, start=last-len(new_versions)+1):
+                    values.update(observation_id=offset, observed_at=observed)
+            if archived:
+                conn.execute(market_candle_revisions.insert(), archived)
+            if accepted:
+                insert = sqlite_insert if conn.dialect.name == "sqlite" else pg_insert
+                statement = insert(market_candles)
+                conn.execute(statement.on_conflict_do_update(
                     index_elements=["symbol", "interval", "time"],
-                    set_={
-                        field: statement.excluded[field]
-                        for field in (*fields, "confirmed_at")
-                        if field != "time"
-                    },
-                    # A stale/unconfirmed write cannot replace a final snapshot.
-                    where=or_(
-                        market_candles.c.confirmed_at.is_(None),
-                        statement.excluded.confirmed_at >= market_candles.c.confirmed_at,
-                    ),
-                ),
-                values,
-            )
+                    set_={f: statement.excluded[f] for f in next(iter(accepted.values()))
+                          if f not in ("symbol", "interval", "time")},
+                ), list(accepted.values()))
+
+    @staticmethod
+    def _candles_at(conn, symbol, interval, reference_time, cutoff_id, limit):
+        versions = union_all(select(market_candles), select(*[
+            market_candle_revisions.c[c.name] for c in market_candles.c
+        ])).subquery()
+        ranked = select(*versions.c, func.row_number().over(
+            partition_by=versions.c.time, order_by=versions.c.observation_id.desc()
+        ).label("version_rank")).where(
+            versions.c.symbol == symbol, versions.c.interval == interval,
+            versions.c.observation_id <= cutoff_id, versions.c.observed_at.is_not(None),
+            versions.c.confirmed_at.is_not(None),
+            versions.c.close_time < versions.c.confirmed_at,
+            versions.c.close_time < reference_time,
+        ).subquery()
+        rows = conn.execute(select(ranked).where(ranked.c.version_rank == 1)
+                            .order_by(ranked.c.time.desc()).limit(limit)).mappings().all()
+        # Preserve decimal inputs exactly; analyze() retains its existing float
+        # conversion/indicator semantics. Metadata is NOT part of candle input.
+        return [dict(time=r["time"], **json.loads(r["numeric_values"]), close_time=r["close_time"])
+                for r in reversed(rows)]
+
+    def get_candles_at(self, symbol, interval, reference_time, cutoff_id, limit=200):
+        """Latest confirmed version of each key as known at a committed cutoff."""
+        if type(cutoff_id) is not int or cutoff_id < 0 or type(reference_time) is not int:
+            raise ValueError("Invalid point-in-time cutoff")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self.engine.connect() as conn:
+            return self._candles_at(conn, symbol, interval, reference_time, cutoff_id, limit)
+
+    def strategy_inputs(self, symbol, reference_time, windows, *, cutoff_id=None):
+        """Capture committed cutoff + exact windows together, or replay a cutoff.
+
+        The allocator is read only after acquiring the writer lock, never a
+        sequence last_value that another transaction has not committed yet.
+        """
+        if type(reference_time) is not int or any(type(n) is not int or not 1 <= n <= 1000
+                                                for n in windows.values()):
+            raise ValueError("Invalid strategy input window")
+        with self._candle_transaction() as conn:
+            state = conn.execute(select(market_data_state).where(market_data_state.c.id == 1)).mappings().one()
+            committed = state["last_observation_id"]
+            cutoff = committed if cutoff_id is None else cutoff_id
+            if type(cutoff) is not int or not 0 <= cutoff <= committed:
+                raise ValueError("Cutoff must be a committed observation")
+            candles = {interval: self._candles_at(conn, symbol, interval, reference_time, cutoff, count)
+                       for interval, count in windows.items()}
+            started = state["revision_tracking_started_at"]
+            boundary = started.isoformat() + ("Z" if started.tzinfo is None else "")
+            return dict(input_data_cutoff_id=cutoff, candles=candles,
+                        revision_tracking_started_at=boundary)
 
     def get_candles(self, symbol, interval, limit=200, *, confirmed_only=False):
         """Return the latest candles in chronological order, or an empty list."""
@@ -320,15 +454,24 @@ class Store:
         """
         result_fields = {
             "id", "actual_price", "change_pct", "observed_direction", "correct",
-            "evaluated_at", "evaluation_note", "last_attempt_at",
+            "evaluated_at", "evaluation_note", "last_attempt_at", "recorded_at",
         }
         fields = {c.name for c in strategy_forecasts.c} - result_fields
         prepared = []
         contexts = {}
         for record in records:
             values = dict(record)
+            # Old engines/history have no point-in-time input; never invent it.
+            values.setdefault("input_data_cutoff_id", None)
+            values.setdefault("input_hash", None)
             if set(values) != fields:
                 raise ValueError("Provide exactly the original strategy forecast fields")
+            cutoff, digest = values["input_data_cutoff_id"], values["input_hash"]
+            if (cutoff is None) != (digest is None) or cutoff is not None and (
+                type(cutoff) is not int or cutoff <= 0 or not isinstance(digest, str)
+                or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
+            ):
+                raise ValueError("Provide a valid input cutoff and SHA-256 together")
             for key in ("input_close_at", "issued_at", "due_at", "horizon"):
                 if type(values[key]) is not int:
                     raise ValueError(f"{key} must be an integer")

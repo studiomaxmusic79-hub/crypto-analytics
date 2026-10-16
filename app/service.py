@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from . import krypta_strategy
 from .analytics import analyze, evaluate
 from .market import INTERVALS, MarketError
+from .market_inputs import input_hash, strategy_provenance
 from .strategies import (
     HOUR_MS, MIN_BARS, STRATEGY_A, STRATEGY_B, VERSION,
     analyze_strategies, evaluate_result, evaluation_thresholds,
@@ -59,11 +60,12 @@ class ForecastService:
         return [
             {
                 "time": int(c[0]),
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-                "volume": float(c[5]),
+                # Preserve Binance decimal strings until storage normalization.
+                "open": c[1],
+                "high": c[2],
+                "low": c[3],
+                "close": c[4],
+                "volume": c[5],
                 "close_time": int(c[6]),
             }
             for c in candles
@@ -176,18 +178,21 @@ class ForecastService:
         if any(existing):
             raise MarketError("Krypta: incomplete published release; overwrite forbidden")
 
-        inputs = {}
         confirmations = {}
         for interval, count in krypta_strategy.WINDOW_BARS.items():
             expected_close = reference // INTERVALS[interval] * INTERVALS[interval]
             confirmed_at = self.candle_updates.get((symbol, interval))
             if confirmed_at is None or not expected_close <= confirmed_at <= now:
                 raise MarketError(f"Krypta: {symbol} {interval} close is not confirmed")
-            saved = await asyncio.to_thread(
-                self.store.get_candles, symbol, interval, max(HISTORY_BARS, count + 1)
-            )
-            inputs[interval] = [c for c in saved if c["close_time"] < reference]
             confirmations[interval] = confirmed_at
+
+        snapshot = await asyncio.to_thread(
+            self.store.strategy_inputs, symbol, reference, krypta_strategy.WINDOW_BARS,
+        )
+        inputs = snapshot["candles"]
+        digest = input_hash(inputs)
+        provenance = strategy_provenance(krypta_strategy)
+        provenance["revision_tracking_started_at"] = snapshot["revision_tracking_started_at"]
 
         # Identify the actual hourly input rather than backfilling an older hour.
         hourly = inputs["1h"]
@@ -212,6 +217,7 @@ class ForecastService:
         )
         diagnostics = {
             **result, "score_source": "T1h", "confirmed_at": confirmations,
+            "provenance": provenance,
         }
         def publish():
             # Sample in the writing thread, after reads, analysis and queueing.
@@ -238,6 +244,8 @@ class ForecastService:
                 "indicators": diagnostics,
                 "evaluation_version": EVALUATION_VERSION,
                 "neutral_pct": thresholds[horizon],
+                "input_data_cutoff_id": snapshot["input_data_cutoff_id"],
+                "input_hash": digest,
             } for horizon in (1, 4)]
             self.store.save_strategy_forecasts(records)
             logger.info("Krypta %s: LIVE %s at %s", symbol, result["signal"], issued_at)

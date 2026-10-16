@@ -63,7 +63,8 @@ def test_init_adds_table_to_existing_database_without_changing_old_forecasts(tmp
     old.init()
     old.init()
     assert set(inspect(old.engine).get_table_names()) == {
-        "forecasts", "market_quotes", "market_candles", "strategy_forecasts"
+        "forecasts", "market_quotes", "market_candles", "strategy_forecasts",
+        "market_candle_revisions", "market_data_state",
     }
     assert old.latest("BTCUSDT") == before
     old.close()
