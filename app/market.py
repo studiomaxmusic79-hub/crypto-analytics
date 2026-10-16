@@ -41,6 +41,7 @@ class BinanceMarket:
         if path not in (
             "time",
             "ticker/24hr",
+            "ticker/bookTicker",
             "klines"
         ):
             raise ValueError(
@@ -323,6 +324,10 @@ class BinanceMarket:
             raise MarketError(
                 "Некорректная котировка Binance"
             ) from exc
+
+    async def book_ticker(self, symbol):
+        # Uncached, one attempt. Validation and persistence belong to protocol.
+        return await self.get("ticker/bookTicker", {"symbol": symbol})
 
     async def klines(
         self,

@@ -1,6 +1,7 @@
 import json
 import math
 import os
+from datetime import timezone
 from contextlib import contextmanager
 from pathlib import Path
 from sqlalchemy import (
@@ -12,6 +13,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
 from .market_inputs import NUMERIC_FIELDS, numeric_values
+from . import evaluation_protocol as protocol
+from .strategies import evaluate_result
 
 metadata = MetaData()
 
@@ -98,12 +101,38 @@ market_data_state = Table(
     Column("last_observation_id", BigInteger, nullable=False),
     Column("revision_tracking_started_at", DateTime(timezone=True), nullable=False,
            server_default=func.current_timestamp()),
+    Column("evaluation_protocol_started_at", DateTime(timezone=True),
+           server_default=func.current_timestamp()),
 )
 
 
 STRATEGY_FORECAST_KEY = (
     "symbol", "input_close_at", "strategy_id", "strategy_version", "horizon"
 )
+
+PUBLISH_KEY = ("symbol", "input_close_at", "strategy_id", "strategy_version")
+publish_observations = Table(
+    "strategy_publish_observations", metadata,
+    *[Column(k, BigInteger if k == "input_close_at" else String(64), primary_key=True)
+      for k in PUBLISH_KEY],
+    *[Column(k, Text) for k in ("bid_price", "ask_price", "bid_qty", "ask_qty", "mid_price")],
+    Column("request_started_at", BigInteger),
+    Column("response_received_at", BigInteger),
+    Column("provider", Text, nullable=False),
+    Column("endpoint", Text, nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("error", Text),
+)
+
+PROTOCOL_RESULT_TYPES = {
+    "target_observation_id": BigInteger,
+    "target_observed_at": DateTime(timezone=True),
+    "result_status": String(32),
+    "live_status": String(32),
+    "live_change_pct": Float,
+    "live_observed_direction": String(4),
+    "live_correct": Boolean,
+}
 
 # LIVE records only. BACKTEST issuance is intentionally not enabled by this
 # schema: the actual issue time must be within five minutes of the hourly close.
@@ -133,6 +162,7 @@ strategy_forecasts = Table(
     Column("evaluated_at", BigInteger),
     Column("evaluation_note", Text),
     Column("last_attempt_at", BigInteger),
+    *[Column(k, kind) for k, kind in PROTOCOL_RESULT_TYPES.items()],
     Column("input_data_cutoff_id", BigInteger),
     Column("input_hash", String(64)),
     Column("recorded_at", DateTime(timezone=True),
@@ -232,7 +262,11 @@ class Store:
                                     "observed_at": "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME",
                                     "numeric_values": "TEXT"}),
                 ("strategy_forecasts", {"input_data_cutoff_id": "BIGINT", "input_hash": "VARCHAR(64)",
-                                        "recorded_at": "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME"}),
+                                        "recorded_at": "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME",
+                                        **{k: str(Column(k, v).type.compile(dialect=conn.dialect))
+                                           for k, v in PROTOCOL_RESULT_TYPES.items()}}),
+                ("market_data_state", {"evaluation_protocol_started_at":
+                                      "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME"}),
             ):
                 existing = {c["name"] for c in inspect(conn).get_columns(table)}
                 for name, kind in additions.items():
@@ -250,6 +284,9 @@ class Store:
             insert = pg_insert if postgres else sqlite_insert
             conn.execute(insert(market_data_state).values(id=1, last_observation_id=0)
                          .on_conflict_do_nothing(index_elements=["id"]))
+            conn.execute(market_data_state.update().where(
+                market_data_state.c.evaluation_protocol_started_at.is_(None)
+            ).values(evaluation_protocol_started_at=func.current_timestamp()))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS market_candle_observation "
                               "ON market_candles (observation_id)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS market_revision_key "
@@ -456,6 +493,7 @@ class Store:
             "id", "actual_price", "change_pct", "observed_direction", "correct",
             "evaluated_at", "evaluation_note", "last_attempt_at", "recorded_at",
         }
+        result_fields.update(PROTOCOL_RESULT_TYPES)
         fields = {c.name for c in strategy_forecasts.c} - result_fields
         prepared = []
         contexts = {}
@@ -514,6 +552,12 @@ class Store:
                 ).scalar_one_or_none()
                 if forecast_id is not None:
                     inserted += 1
+                    if values["evaluation_version"] == protocol.VERSION:
+                        conn.execute(insert(publish_observations).values(
+                            **{k: values[k] for k in PUBLISH_KEY}, status="PENDING",
+                            provider="Binance Spot / data-api.binance.vision",
+                            endpoint=protocol.ENDPOINT,
+                        ).on_conflict_do_nothing(index_elements=list(PUBLISH_KEY)))
                     continue
                 existing = conn.execute(
                     select(strategy_forecasts).where(*[
@@ -593,6 +637,40 @@ class Store:
                 raise ValueError("Cannot evaluate before the target hourly close")
             if evaluation.get("status", "OK") != "OK":
                 raise ValueError("Only a completed evaluation can be saved")
+            protocol_values = {}
+            if row["evaluation_version"] == protocol.VERSION:
+                # Select and evaluate inside the same short DB transaction.
+                # Earliest eligible accepted version wins, even after correction.
+                target = self._target_observation(conn, row["symbol"], row["due_at"])
+                if target is None:
+                    return False
+                horizon = row["horizon"]
+                frozen = {**row, "due_at": {horizon: row["due_at"]},
+                          "thresholds_pct": {horizon: row["neutral_pct"]}}
+                def calculate(base):
+                    return evaluate_result(
+                        {**frozen, "base_price": base}, horizon, dict(target),
+                        now=now, confirmed_at=row["due_at"],
+                    )
+                evaluation = calculate(row["base_price"])
+                observed = target["observed_at"]
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                observed_ms = observed.timestamp() * 1000
+                timing = ("OK" if observed_ms <= row["due_at"] + protocol.TARGET_WINDOW_MS
+                          else "LATE_TARGET_DATA")
+                protocol_values = dict(target_observation_id=target["observation_id"],
+                                       target_observed_at=observed, result_status=timing,
+                                       live_status="UNAVAILABLE")
+                quote = conn.execute(select(publish_observations).where(*[
+                    publish_observations.c[k] == row[k] for k in PUBLISH_KEY
+                ])).mappings().first()
+                if quote and quote["status"] == "OK":
+                    live = calculate(float(quote["mid_price"]))
+                    protocol_values.update(live_status=timing,
+                                           live_change_pct=live["change_pct"],
+                                           live_observed_direction=live["observed_direction"],
+                                           live_correct=live["correct"])
             values = {key: evaluation[key] for key in (
                 "actual_price", "change_pct", "observed_direction"
             )}
@@ -609,9 +687,53 @@ class Store:
             )
             result = conn.execute(
                 strategy_forecasts.update().where(*pending)
-                .values(**values, evaluated_at=now, evaluation_note=None)
+                .values(**values, **protocol_values, evaluated_at=now, evaluation_note=None)
             )
             return result.rowcount == 1
+
+    @staticmethod
+    def _target_observation(conn, symbol, due_at):
+        versions = union_all(select(market_candles), select(*[
+            market_candle_revisions.c[c.name] for c in market_candles.c
+        ])).subquery()
+        c = versions.c
+        return conn.execute(select(versions).where(
+            c.symbol == symbol, c.interval == "1h", c.time == due_at - 3_600_000,
+            c.close_time == due_at - 1, c.confirmed_at >= due_at,
+            c.observation_id.is_not(None), c.observed_at.is_not(None),
+        ).order_by(c.observation_id).limit(1)).mappings().first()
+
+    def publish_observation(self, symbol, input_close_at, strategy_id, strategy_version):
+        with self.engine.connect() as conn:
+            row = conn.execute(select(publish_observations).where(*[
+                publish_observations.c[k] == value for k, value in zip(
+                    PUBLISH_KEY, (symbol, input_close_at, strategy_id, strategy_version))
+            ])).mappings().first()
+            return dict(row) if row else None
+
+    def target_observation(self, symbol, due_at):
+        with self.engine.connect() as conn:
+            row = self._target_observation(conn, symbol, due_at)
+            return dict(row) if row else None
+
+    def claim_publish_observation(self, key, started_at):
+        # A durable one-attempt claim; a process crash remains REQUESTING.
+        with self.engine.begin() as conn:
+            result = conn.execute(publish_observations.update().where(*[
+                publish_observations.c[k] == key[k] for k in PUBLISH_KEY
+            ], publish_observations.c.status == "PENDING").values(
+                status="REQUESTING", request_started_at=started_at))
+            return result.rowcount == 1
+
+    def finish_publish_observation(self, key, received_at, *, data=None, error=None):
+        fields = protocol.normalize_quote(data, key["symbol"]) if data is not None else {}
+        with self.engine.begin() as conn:
+            return conn.execute(publish_observations.update().where(*[
+                publish_observations.c[k] == key[k] for k in PUBLISH_KEY
+            ], publish_observations.c.status == "REQUESTING").values(
+                **fields, response_received_at=received_at,
+                status="OK" if data is not None else "QUOTE_FAILED", error=error,
+            )).rowcount == 1
 
     def note_strategy_forecast(self, forecast_id, note, now):
         c = strategy_forecasts.c

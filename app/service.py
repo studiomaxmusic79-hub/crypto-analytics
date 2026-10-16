@@ -5,6 +5,7 @@ import time
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import krypta_strategy
+from . import evaluation_protocol as protocol
 from .analytics import analyze, evaluate
 from .market import INTERVALS, MarketError
 from .market_inputs import input_hash, strategy_provenance
@@ -242,15 +243,36 @@ class ForecastService:
                 "score": result["T1h"],
                 "reason_codes": result["reason_codes"],
                 "indicators": diagnostics,
-                "evaluation_version": EVALUATION_VERSION,
+                "evaluation_version": protocol.VERSION,
                 "neutral_pct": thresholds[horizon],
                 "input_data_cutoff_id": snapshot["input_data_cutoff_id"],
                 "input_hash": digest,
             } for horizon in (1, 4)]
-            self.store.save_strategy_forecasts(records)
+            inserted = self.store.save_strategy_forecasts(records)
             logger.info("Krypta %s: LIVE %s at %s", symbol, result["signal"], issued_at)
+            return inserted
 
-        await asyncio.to_thread(publish)
+        if await asyncio.to_thread(publish):
+            key = dict(symbol=symbol, input_close_at=reference,
+                       strategy_id=result["strategy_id"], strategy_version=result["strategy_version"])
+            await self.observe_publication(key)
+
+    async def observe_publication(self, key):
+        started = int(time.time() * 1000)
+        if not await asyncio.to_thread(self.store.claim_publish_observation, key, started):
+            return
+        # Both the forecast commit and claim commit precede all Binance I/O.
+        try:
+            data = await self.market.book_ticker(key["symbol"])
+            received = int(time.time() * 1000)
+            protocol.normalize_quote(data, key["symbol"])
+        except Exception as exc:
+            await asyncio.to_thread(
+                self.store.finish_publish_observation, key, int(time.time() * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        await asyncio.to_thread(self.store.finish_publish_observation, key, received, data=data)
 
     async def generate_strategies(self, symbol, now):
         input_close_at = now // HOUR_MS * HOUR_MS
@@ -321,7 +343,7 @@ class ForecastService:
         targets = {}
         for row in rows:
             try:
-                if row["evaluation_version"] != EVALUATION_VERSION:
+                if row["evaluation_version"] not in (EVALUATION_VERSION, protocol.VERSION):
                     await asyncio.to_thread(
                         self.store.note_strategy_forecast, row["id"],
                         "Неизвестная версия правил проверки стратегий", now,
@@ -329,7 +351,13 @@ class ForecastService:
                     self.errors["strategy_evaluation"] = "Неизвестная версия правил проверки"
                     continue
                 symbol, due_at = row["symbol"], row["due_at"]
-                key = (symbol, due_at)
+                key = (symbol, due_at, row["evaluation_version"])
+                if key not in targets and row["evaluation_version"] == protocol.VERSION:
+                    accepted = await asyncio.to_thread(
+                        self.store.target_observation, symbol, due_at,
+                    )
+                    if accepted is not None:
+                        targets[key] = (accepted, due_at)
                 if key not in targets:
                     if symbol not in hourly:
                         saved = await asyncio.to_thread(

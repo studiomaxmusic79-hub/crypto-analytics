@@ -170,6 +170,7 @@ def test_init_migrates_existing_candles_without_certifying_or_losing_them(tmp_pa
     assert set(inspect(store.engine).get_table_names()) == {
         "forecasts", "strategy_forecasts", "market_quotes", "market_candles",
         "market_candle_revisions", "market_data_state",
+        "strategy_publish_observations",
     }
     store.close()
 
