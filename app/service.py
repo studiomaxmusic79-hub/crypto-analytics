@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from . import krypta_strategy
 from . import evaluation_protocol as protocol
+from . import publication
 from .analytics import analyze, evaluate
 from .market import INTERVALS, MarketError
 from .market_inputs import input_hash, strategy_provenance
@@ -157,8 +158,11 @@ class ForecastService:
         self.candle_updates[key] = now
 
     async def generate_krypta(self, symbol, now):
-        """Publish one immutable MTF decision, with the existing 1h/4h checks."""
+        """Record one immutable MTF decision; DB commit is not publication."""
         reference = now // HOUR_MS * HOUR_MS
+        journal = await asyncio.to_thread(self.store.publication_slot, reference)
+        if journal and (journal["batch_bytes"] is not None or journal["status"] != "PREPARING"):
+            return
 
         def in_live_window():
             # The actual issue time is exclusive of HH:05, unlike old engines.
@@ -167,6 +171,8 @@ class ForecastService:
         if not in_live_window():
             logger.info("Krypta %s: outside LIVE window for %s", symbol, reference)
             return
+        if journal is None:
+            await asyncio.to_thread(self.store.prepare_publication_slot, now)
 
         existing = await asyncio.to_thread(lambda: [
             self.store.has_strategy_forecast(
@@ -243,7 +249,7 @@ class ForecastService:
                 "score": result["T1h"],
                 "reason_codes": result["reason_codes"],
                 "indicators": diagnostics,
-                "evaluation_version": protocol.VERSION,
+                "evaluation_version": publication.VERSION,
                 "neutral_pct": thresholds[horizon],
                 "input_data_cutoff_id": snapshot["input_data_cutoff_id"],
                 "input_hash": digest,
@@ -343,7 +349,7 @@ class ForecastService:
         targets = {}
         for row in rows:
             try:
-                if row["evaluation_version"] not in (EVALUATION_VERSION, protocol.VERSION):
+                if row["evaluation_version"] not in (EVALUATION_VERSION, *protocol.VERSIONS):
                     await asyncio.to_thread(
                         self.store.note_strategy_forecast, row["id"],
                         "Неизвестная версия правил проверки стратегий", now,
@@ -352,7 +358,7 @@ class ForecastService:
                     continue
                 symbol, due_at = row["symbol"], row["due_at"]
                 key = (symbol, due_at, row["evaluation_version"])
-                if key not in targets and row["evaluation_version"] == protocol.VERSION:
+                if key not in targets and row["evaluation_version"] in protocol.VERSIONS:
                     accepted = await asyncio.to_thread(
                         self.store.target_observation, symbol, due_at,
                     )
@@ -637,6 +643,10 @@ class ForecastService:
         # Время Binance получаем только один раз
         # за весь цикл.
         now = await self.market.time_ms()
+        journal = None
+        failures = {}
+        if self.enable_krypta:
+            journal = await asyncio.to_thread(self.store.prepare_publication_slot, now)
 
         self.errors.pop(
             "connection",
@@ -663,10 +673,24 @@ class ForecastService:
                     self.errors.pop(key, None)
                 except (MarketError, ValueError) as exc:
                     self.errors[key] = str(exc)
+                    if key == f"{symbol}:krypta":
+                        failures[symbol] = dict(
+                            status="DATA_UNAVAILABLE" if isinstance(exc, MarketError)
+                            and "calculation failed" not in str(exc) else "ERROR",
+                            reason=str(exc),
+                        )
                 except SQLAlchemyError as exc:
                     # Store's transaction context has already rolled back.
                     self.errors[key] = f"{type(exc).__name__}: {exc}"
+                    if key == f"{symbol}:krypta":
+                        failures[symbol] = dict(status="ERROR", reason=self.errors[key])
                     logger.exception("Database operation failed: %s", key)
+
+        if journal and journal["status"] == "PREPARING" and journal["batch_bytes"] is None:
+            await asyncio.to_thread(
+                self.store.freeze_publication_slot, journal["slot_utc"],
+                int(time.time() * 1000), strategy_provenance(krypta_strategy), failures,
+            )
 
         self.errors.pop(
             "evaluation",

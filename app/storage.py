@@ -6,7 +6,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, BigInteger,
-    String, Float, Text, Boolean, DateTime, UniqueConstraint, CheckConstraint,
+    String, Float, Text, Boolean, DateTime, LargeBinary, Index, UniqueConstraint, CheckConstraint,
+    ForeignKeyConstraint,
     select, func, case, and_, or_, inspect, text, union_all
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -14,6 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
 from .market_inputs import NUMERIC_FIELDS, numeric_values
 from . import evaluation_protocol as protocol
+from . import publication
 from .strategies import evaluate_result
 
 metadata = MetaData()
@@ -122,6 +124,62 @@ publish_observations = Table(
     Column("endpoint", Text, nullable=False),
     Column("status", String(32), nullable=False),
     Column("error", Text),
+    # Null for historical v1 observations; never relabel old facts.
+    Column("quote_kind", String(32)),
+)
+
+publication_streams = Table(
+    "publication_streams", metadata,
+    Column("project_id", String(64), primary_key=True),
+    Column("official_stream_id", String(64), primary_key=True),
+    Column("stream_status", String(16), nullable=False),
+    Column("strategy_id", String(64), nullable=False),
+    Column("strategy_version", String(32), nullable=False),
+    Column("first_slot_utc", BigInteger, nullable=False),
+    Column("last_checked_slot_utc", BigInteger, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False,
+           server_default=func.current_timestamp()),
+    CheckConstraint("stream_status IN ('OFFICIAL', 'EXPERIMENTAL')", name="publication_stream_role"),
+)
+Index("one_official_stream_per_project", publication_streams.c.project_id, unique=True,
+      sqlite_where=publication_streams.c.stream_status == "OFFICIAL",
+      postgresql_where=publication_streams.c.stream_status == "OFFICIAL")
+
+official_slots = Table(
+    "official_slots", metadata,
+    Column("project_id", String(64), primary_key=True),
+    Column("official_stream_id", String(64), primary_key=True),
+    Column("slot_utc", BigInteger, primary_key=True),
+    Column("protocol_version", String(32), nullable=False),
+    Column("strategy_id", String(64), nullable=False),
+    Column("strategy_version", String(32), nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("created_at", BigInteger, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False,
+           server_default=func.current_timestamp()),
+    Column("batch_id", String(80)),
+    Column("batch_hash", String(64)),
+    Column("batch_bytes", LargeBinary),
+    Column("frozen_at", BigInteger),
+    Column("publication_status", String(32), nullable=False),
+    Column("error", Text),
+    Column("external_object_key", Text),
+    Column("external_object_version", Text),
+    Column("witness_id", Text),
+    Column("witness_sequence", Text),
+    Column("witness_accepted_at", BigInteger),
+    Column("public_read_confirmed_at", BigInteger),
+    Column("published_at", BigInteger),
+    ForeignKeyConstraint(["project_id", "official_stream_id"],
+                         ["publication_streams.project_id", "publication_streams.official_stream_id"]),
+    CheckConstraint("slot_utc % 3600000 = 0", name="publication_hourly_slot"),
+    CheckConstraint("status IN (" + ",".join(repr(s) for s in publication.SLOT_STATUSES) + ")",
+                    name="publication_slot_status"),
+    CheckConstraint("publication_status IN (" + ",".join(repr(s) for s in publication.PUBLICATION_STATES) + ")",
+                    name="publication_workflow_status"),
+    CheckConstraint("(batch_id IS NULL AND batch_hash IS NULL AND batch_bytes IS NULL AND frozen_at IS NULL) OR "
+                    "(batch_id IS NOT NULL AND batch_hash IS NOT NULL AND batch_bytes IS NOT NULL AND frozen_at IS NOT NULL)",
+                    name="publication_batch_shape"),
 )
 
 PROTOCOL_RESULT_TYPES = {
@@ -267,6 +325,7 @@ class Store:
                                            for k, v in PROTOCOL_RESULT_TYPES.items()}}),
                 ("market_data_state", {"evaluation_protocol_started_at":
                                       "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME"}),
+                ("strategy_publish_observations", {"quote_kind": "VARCHAR(32)"}),
             ):
                 existing = {c["name"] for c in inspect(conn).get_columns(table)}
                 for name, kind in additions.items():
@@ -310,6 +369,116 @@ class Store:
 
     def close(self):
         self.engine.dispose()
+
+    @contextmanager
+    def _publication_transaction(self):
+        """Short DB-only boundary; PostgreSQL uses per-stream/per-slot row locks."""
+        with self.engine.connect() as conn:
+            with conn.begin():
+                if conn.dialect.name == "sqlite":
+                    conn.exec_driver_sql("BEGIN IMMEDIATE")
+                yield conn
+
+    @staticmethod
+    def _official_where(table, slot=None):
+        conditions = [table.c.project_id == publication.PROJECT_ID,
+                      table.c.official_stream_id == publication.STREAM_ID]
+        if slot is not None:
+            conditions.append(table.c.slot_utc == slot)
+        return conditions
+
+    def publication_slot(self, slot):
+        with self.engine.connect() as conn:
+            row = conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot))).mappings().first()
+            return dict(row) if row else None
+
+    def prepare_publication_slot(self, now):
+        """Activate once, journal missing elapsed hours, then prepare current hour.
+
+        Never infer a history before first activation; never replace missing slots.
+        """
+        if type(now) is not int or now < 0:
+            raise ValueError("Expected UTC milliseconds")
+        slot = now // publication.HOUR_MS * publication.HOUR_MS
+        insert = sqlite_insert if self.engine.dialect.name == "sqlite" else pg_insert
+        identity = dict(project_id=publication.PROJECT_ID,
+                        official_stream_id=publication.STREAM_ID,
+                        strategy_id=publication.STRATEGY_ID,
+                        strategy_version=publication.STRATEGY_VERSION)
+        with self._publication_transaction() as conn:
+            conn.execute(insert(publication_streams).values(
+                **identity, stream_status="OFFICIAL", first_slot_utc=slot,
+                last_checked_slot_utc=slot,
+            ).on_conflict_do_nothing(index_elements=["project_id", "official_stream_id"]))
+            stream = conn.execute(select(publication_streams).where(
+                *self._official_where(publication_streams)).with_for_update()).mappings().one()
+            if (stream["stream_status"] != "OFFICIAL"
+                or stream["strategy_id"] != publication.STRATEGY_ID
+                or stream["strategy_version"] != publication.STRATEGY_VERSION):
+                raise ValueError("Official stream identity cannot be replaced")
+            if slot < stream["first_slot_utc"]:
+                raise ValueError("Slot precedes publication journal activation")
+            # The saved watermark bounds work across years of repeated ticks.
+            for missed in range(stream["last_checked_slot_utc"], slot, publication.HOUR_MS):
+                conn.execute(insert(official_slots).values(
+                    **identity, slot_utc=missed, protocol_version=publication.VERSION,
+                    status="MISSING_UNEXPLAINED", created_at=now,
+                    publication_status="NOT_SUBMITTED",
+                ).on_conflict_do_nothing(index_elements=["project_id", "official_stream_id", "slot_utc"]))
+            conn.execute(official_slots.update().where(
+                *self._official_where(official_slots), official_slots.c.status == "PREPARING",
+                official_slots.c.batch_bytes.is_(None), official_slots.c.slot_utc < slot,
+            ).values(status="ERROR", error="PREPARATION_NOT_FROZEN_BY_DEADLINE"))
+            conn.execute(insert(official_slots).values(
+                **identity, slot_utc=slot, protocol_version=publication.VERSION,
+                status="PREPARING", created_at=now, publication_status="NOT_SUBMITTED",
+            ).on_conflict_do_nothing(index_elements=["project_id", "official_stream_id", "slot_utc"]))
+            conn.execute(publication_streams.update().where(
+                *self._official_where(publication_streams),
+                publication_streams.c.last_checked_slot_utc < slot,
+            ).values(last_checked_slot_utc=slot))
+            row = conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot))).mappings().one()
+            return dict(row)
+
+    def freeze_publication_slot(self, slot, now, code_config, failures=None):
+        """Freeze the first fixed BTC+ETH composition; retries return exact bytes."""
+        if type(now) is not int or now < slot:
+            raise ValueError("Cannot freeze before slot")
+        failures = failures or {}
+        if any(v.get("status") not in ("ERROR", "DATA_UNAVAILABLE") for v in failures.values()):
+            raise ValueError("Invalid technical entry status")
+        with self._publication_transaction() as conn:
+            journal = conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot)).with_for_update()).mappings().one()
+            if journal["batch_bytes"] is not None or journal["status"] != "PREPARING":
+                return dict(journal)
+            c = strategy_forecasts.c
+            rows = conn.execute(select(strategy_forecasts).where(
+                c.input_close_at == slot, c.strategy_id == journal["strategy_id"],
+                c.strategy_version == journal["strategy_version"],
+                c.evaluation_version == publication.VERSION,
+                c.symbol.in_(publication.SYMBOLS),
+            )).all()
+            payload = publication.build_batch(slot, [self._decode_strategy(r) for r in rows],
+                                              failures, code_config)
+            raw = publication.canonical_bytes(payload)
+            batch_id, digest = publication.batch_identity(raw)
+            statuses = [e["status"] for e in payload["entries"]]
+            status = ("LATE" if now >= slot + publication.DEADLINE_MS else
+                      "ERROR" if "ERROR" in statuses else
+                      "DATA_UNAVAILABLE" if all(s != "OK" for s in statuses) else "BATCH_FROZEN")
+            problems = {e["symbol"]: e.get("reason") for e in payload["entries"] if e["status"] != "OK"}
+            error = json.dumps(problems, sort_keys=True) if problems else None
+            if status == "LATE":
+                error = "BATCH_FROZEN_AFTER_DEADLINE" + (": " + error if error else "")
+            conn.execute(official_slots.update().where(*self._official_where(official_slots, slot)).values(
+                status=status, batch_id=batch_id, batch_hash=digest, batch_bytes=raw,
+                frozen_at=now, publication_status="BATCH_FROZEN", error=error,
+            ))
+            return dict(conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot))).mappings().one())
 
     def ready(self):
         with self.engine.connect() as conn:
@@ -543,8 +712,31 @@ class Store:
 
         insert = sqlite_insert if self.engine.dialect.name == "sqlite" else pg_insert
         inserted = 0
-        with self.engine.begin() as conn:
+        transaction = (self._publication_transaction if any(
+            v["evaluation_version"] == publication.VERSION for v in prepared) else self.engine.begin)
+        with transaction() as conn:
+            closed_slots = set()
+            for slot in sorted({v["input_close_at"] for v in prepared
+                                if v["evaluation_version"] == publication.VERSION}):
+                journal = conn.execute(select(official_slots).where(
+                    *self._official_where(official_slots, slot)).with_for_update()).mappings().first()
+                if journal is None:
+                    raise ValueError("Prepare the official slot before recording v1.1 forecasts")
+                if journal["status"] != "PREPARING" or journal["batch_bytes"] is not None:
+                    closed_slots.add(slot)
             for values in prepared:
+                if values["evaluation_version"] == publication.VERSION:
+                    if (values["strategy_id"] != publication.STRATEGY_ID
+                        or values["strategy_version"] != publication.STRATEGY_VERSION
+                        or values["symbol"] not in publication.SYMBOLS):
+                        raise ValueError("Forecast does not belong to the official stream")
+                    if values["input_close_at"] in closed_slots:
+                        existing = conn.execute(select(strategy_forecasts).where(*[
+                            strategy_forecasts.c[k] == values[k] for k in STRATEGY_FORECAST_KEY
+                        ])).mappings().first()
+                        if existing is None or any(existing[k] != v for k, v in values.items()):
+                            raise ValueError("Official slot is closed; frozen composition cannot change")
+                        continue
                 forecast_id = conn.execute(
                     insert(strategy_forecasts).values(**values)
                     .on_conflict_do_nothing(index_elements=list(STRATEGY_FORECAST_KEY))
@@ -552,11 +744,13 @@ class Store:
                 ).scalar_one_or_none()
                 if forecast_id is not None:
                     inserted += 1
-                    if values["evaluation_version"] == protocol.VERSION:
+                    if values["evaluation_version"] in protocol.VERSIONS:
                         conn.execute(insert(publish_observations).values(
                             **{k: values[k] for k in PUBLISH_KEY}, status="PENDING",
                             provider="Binance Spot / data-api.binance.vision",
                             endpoint=protocol.ENDPOINT,
+                            quote_kind=("POST_RECORD_QUOTE" if values["evaluation_version"] == publication.VERSION
+                                        else None),
                         ).on_conflict_do_nothing(index_elements=list(PUBLISH_KEY)))
                     continue
                 existing = conn.execute(
@@ -638,7 +832,7 @@ class Store:
             if evaluation.get("status", "OK") != "OK":
                 raise ValueError("Only a completed evaluation can be saved")
             protocol_values = {}
-            if row["evaluation_version"] == protocol.VERSION:
+            if row["evaluation_version"] in protocol.VERSIONS:
                 # Select and evaluate inside the same short DB transaction.
                 # Earliest eligible accepted version wins, even after correction.
                 target = self._target_observation(conn, row["symbol"], row["due_at"])
@@ -662,10 +856,15 @@ class Store:
                 protocol_values = dict(target_observation_id=target["observation_id"],
                                        target_observed_at=observed, result_status=timing,
                                        live_status="UNAVAILABLE")
+                if row["evaluation_version"] == publication.VERSION:
+                    # This phase has no external publisher or post-publication
+                    # quote. POST_RECORD_QUOTE must never score as LIVE.
+                    protocol_values["live_status"] = "NOT_PUBLISHED_EXTERNALLY"
                 quote = conn.execute(select(publish_observations).where(*[
                     publish_observations.c[k] == row[k] for k in PUBLISH_KEY
                 ])).mappings().first()
-                if quote and quote["status"] == "OK":
+                if (row["evaluation_version"] == protocol.VERSION
+                    and quote and quote["status"] == "OK"):
                     live = calculate(float(quote["mid_price"]))
                     protocol_values.update(live_status=timing,
                                            live_change_pct=live["change_pct"],

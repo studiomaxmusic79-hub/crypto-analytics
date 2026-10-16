@@ -4,6 +4,8 @@ from decimal import Decimal, localcontext
 from .market_inputs import decimal_text
 
 VERSION = "krypta-live-eval-v1"
+PUBLICATION_VERSION = "krypta-live-eval-v1.1"
+VERSIONS = (VERSION, PUBLICATION_VERSION)
 TARGET_WINDOW_MS = 300_000
 ENDPOINT = "/api/v3/ticker/bookTicker"
 

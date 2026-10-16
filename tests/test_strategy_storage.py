@@ -66,6 +66,7 @@ def test_init_adds_table_to_existing_database_without_changing_old_forecasts(tmp
         "forecasts", "market_quotes", "market_candles", "strategy_forecasts",
         "market_candle_revisions", "market_data_state",
         "strategy_publish_observations",
+        "publication_streams", "official_slots",
     }
     assert old.latest("BTCUSDT") == before
     old.close()

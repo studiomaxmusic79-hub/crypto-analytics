@@ -169,10 +169,12 @@ def test_saved_forming_candle_without_post_close_refresh_cannot_issue(live, inte
     assert releases(store) == []
     assert len(releases(store, "ETHUSDT")) == 2
     assert "not confirmed" in service.errors["BTCUSDT:krypta"]
+    frozen = store.publication_slot(CLOSE)
     market.fail.clear()
     clock["now"] += 60_000
     run(service.cycle())
-    assert len(releases(store)) == 2
+    assert releases(store) == []  # v1.1 freezes the explicit missing entry.
+    assert store.publication_slot(CLOSE) == frozen
 
 
 def test_hourly_cutoff_excludes_forming_4h_at_13_utc_and_all_future_inputs(live, monkeypatch):
@@ -253,9 +255,13 @@ def test_calculation_exception_is_visible_and_does_not_block_eth(live, monkeypat
     assert len(releases(store, "ETHUSDT")) == 2
     assert "RuntimeError" in service.errors["BTCUSDT:krypta"]
     assert "simulated calculation failure" in caplog.text
+    frozen = store.publication_slot(CLOSE)
+    assert frozen["status"] == "ERROR"
     clock["now"] += 60_000
     run(service.cycle())
-    assert len(releases(store)) == 2
+    assert releases(store) == []
+    assert len(attempts) == 2  # BTC failure and ETH success; no retry after freeze.
+    assert store.publication_slot(CLOSE) == frozen
 
 
 def test_atomic_database_failure_does_not_block_eth_or_occupy_live_key(live):
@@ -276,14 +282,18 @@ def test_atomic_database_failure_does_not_block_eth_or_occupy_live_key(live):
     assert releases(store) == []  # The first horizon was rolled back as well.
     assert len(releases(store, "ETHUSDT")) == 2
     assert "SQLAlchemyError" in service.errors["BTCUSDT:krypta"]
+    frozen = store.publication_slot(CLOSE)
+    assert frozen["status"] == "ERROR"
     clock["now"] += 60_000
     run(service.cycle())
-    assert len(releases(store)) == 2
+    assert releases(store) == []
+    assert store.publication_slot(CLOSE) == frozen
 
 
 def test_partial_existing_release_is_not_rewritten_or_completed(live):
     clock, store, market, service = live
     run(service.cycle())
+    frozen = store.publication_slot(CLOSE)
     with store.engine.begin() as conn:
         conn.execute(delete(strategy_forecasts).where(
             strategy_forecasts.c.strategy_id == krypta.STRATEGY_ID,
@@ -294,7 +304,9 @@ def test_partial_existing_release_is_not_rewritten_or_completed(live):
     clock["now"] += 60_000
     run(service.cycle())
     assert releases(store) == before
-    assert "incomplete published release" in service.errors["BTCUSDT:krypta"]
+    # The immutable batch remains the original evidence even if a forecast row
+    # is removed out of band; a tick cannot recalculate/recreate the missing row.
+    assert store.publication_slot(CLOSE) == frozen
 
 
 @pytest.mark.parametrize("direction", ["UP", "WAIT"])

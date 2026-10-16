@@ -171,6 +171,7 @@ def test_init_migrates_existing_candles_without_certifying_or_losing_them(tmp_pa
         "forecasts", "strategy_forecasts", "market_quotes", "market_candles",
         "market_candle_revisions", "market_data_state",
         "strategy_publish_observations",
+        "publication_streams", "official_slots",
     }
     store.close()
 
