@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import hashlib
+import uuid
 from datetime import timezone
 from contextlib import contextmanager
 from pathlib import Path
@@ -145,6 +147,16 @@ Index("one_official_stream_per_project", publication_streams.c.project_id, uniqu
       sqlite_where=publication_streams.c.stream_status == "OFFICIAL",
       postgresql_where=publication_streams.c.stream_status == "OFFICIAL")
 
+EXTERNAL_SLOT_TYPES = {
+    "archive_receipt": Text, "witness_receipt": Text, "public_read_receipt": Text,
+    "external_step": String(32), "external_step_status": String(32),
+    "last_publication_attempt_at": BigInteger, "publication_error": Text,
+    "publication_mode": String(16), "publication_claim_token": String(64),
+    "publication_claim_until": BigInteger, "post_publish_quotes": Text,
+    "post_publish_attempted": Boolean,
+}
+PUBLICATION_LEASE_MS = 120_000
+
 official_slots = Table(
     "official_slots", metadata,
     Column("project_id", String(64), primary_key=True),
@@ -170,6 +182,7 @@ official_slots = Table(
     Column("witness_accepted_at", BigInteger),
     Column("public_read_confirmed_at", BigInteger),
     Column("published_at", BigInteger),
+    *[Column(k, kind) for k, kind in EXTERNAL_SLOT_TYPES.items()],
     ForeignKeyConstraint(["project_id", "official_stream_id"],
                          ["publication_streams.project_id", "publication_streams.official_stream_id"]),
     CheckConstraint("slot_utc % 3600000 = 0", name="publication_hourly_slot"),
@@ -190,6 +203,7 @@ PROTOCOL_RESULT_TYPES = {
     "live_change_pct": Float,
     "live_observed_direction": String(4),
     "live_correct": Boolean,
+    "live_evidence_mode": String(16),
 }
 
 # LIVE records only. BACKTEST issuance is intentionally not enabled by this
@@ -326,6 +340,8 @@ class Store:
                 ("market_data_state", {"evaluation_protocol_started_at":
                                       "TIMESTAMP WITH TIME ZONE" if postgres else "DATETIME"}),
                 ("strategy_publish_observations", {"quote_kind": "VARCHAR(32)"}),
+                ("official_slots", {k: str(Column(k, v).type.compile(dialect=conn.dialect))
+                                    for k, v in EXTERNAL_SLOT_TYPES.items()}),
             ):
                 existing = {c["name"] for c in inspect(conn).get_columns(table)}
                 for name, kind in additions.items():
@@ -391,7 +407,153 @@ class Store:
         with self.engine.connect() as conn:
             row = conn.execute(select(official_slots).where(
                 *self._official_where(official_slots, slot))).mappings().first()
-            return dict(row) if row else None
+            return self._decode_publication(row) if row else None
+
+    @staticmethod
+    def _decode_publication(row):
+        values = dict(row)
+        for key in ("archive_receipt", "witness_receipt", "public_read_receipt", "post_publish_quotes"):
+            if values[key] is not None:
+                values[key] = json.loads(values[key])
+        return values
+
+    def pending_publication_slots(self, limit=100):
+        c = official_slots.c
+        with self.engine.connect() as conn:
+            return conn.execute(select(c.slot_utc).where(
+                *self._official_where(official_slots), c.batch_bytes.is_not(None),
+                or_(c.publication_mode.is_(None), c.publication_mode == "mock"),
+                or_(c.external_step_status.is_(None), c.external_step_status.not_in(("CONFLICT", "HASH_MISMATCH"))),
+                or_(c.publication_status != "PUBLISHED", c.post_publish_attempted.is_not(True)),
+            ).order_by(c.slot_utc).limit(limit)).scalars().all()
+
+    def claim_external_publication(self, slot, mode, now):
+        if mode != "mock":
+            raise ValueError("Only mock publication adapters are enabled")
+        with self._publication_transaction() as conn:
+            row = conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot)).with_for_update()).mappings().first()
+            if (row is None or row["batch_bytes"] is None or row["publication_status"] == "PUBLISHED"
+                or row["external_step_status"] in ("CONFLICT", "HASH_MISMATCH")):
+                return None
+            if row["publication_mode"] not in (None, mode):
+                raise ValueError("Cannot reinterpret publication evidence mode")
+            if row["publication_claim_token"] and row["publication_claim_until"] > now:
+                return None
+            token = uuid.uuid4().hex
+            conn.execute(official_slots.update().where(*self._official_where(official_slots, slot)).values(
+                publication_claim_token=token, publication_claim_until=now+PUBLICATION_LEASE_MS,
+                publication_mode=mode, last_publication_attempt_at=now,
+            ))
+            result = dict(row, publication_claim_token=token, publication_claim_until=now+PUBLICATION_LEASE_MS,
+                          publication_mode=mode, last_publication_attempt_at=now)
+            return self._decode_publication(result)
+
+    def external_publication_progress(self, slot, token, now, **values):
+        allowed = {"archive_receipt", "witness_receipt", "public_read_receipt", "publication_status",
+                   "external_step", "external_step_status", "publication_error", "external_object_key",
+                   "external_object_version", "witness_id", "witness_sequence", "witness_accepted_at",
+                   "public_read_confirmed_at"}
+        if set(values) - allowed:
+            raise ValueError("Cannot mutate frozen bytes or publication time through progress")
+        c = official_slots.c
+        with self._publication_transaction() as conn:
+            where = [*self._official_where(official_slots, slot), c.publication_claim_token == token,
+                     c.publication_claim_until > now, c.publication_status != "PUBLISHED"]
+            row = conn.execute(select(official_slots).where(*where).with_for_update()).mappings().first()
+            if row is None:
+                return None
+            transitions = {
+                "BATCH_FROZEN": ("BATCH_FROZEN", "EXTERNAL_SUBMISSION"),
+                "EXTERNAL_SUBMISSION": ("EXTERNAL_SUBMISSION", "WITNESS_ACCEPTED"),
+                "WITNESS_ACCEPTED": ("WITNESS_ACCEPTED", "PUBLIC_READ_CONFIRMED"),
+                "PUBLIC_READ_CONFIRMED": ("PUBLIC_READ_CONFIRMED",),
+            }
+            if values.get("publication_status", row["publication_status"]) not in transitions[row["publication_status"]]:
+                raise ValueError("Invalid external publication transition")
+            if values.get("external_step_status") in ("CONFLICT", "HASH_MISMATCH"):
+                values["status"] = "ERROR"
+            for key in ("archive_receipt", "witness_receipt", "public_read_receipt"):
+                if key in values:
+                    values[key] = json.dumps(values[key], sort_keys=True, allow_nan=False)
+            conn.execute(official_slots.update().where(*where).values(
+                **values, publication_claim_until=now+PUBLICATION_LEASE_MS))
+            return self._decode_publication(conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot))).mappings().one())
+
+    def complete_external_publication(self, slot, token, now):
+        c = official_slots.c
+        with self._publication_transaction() as conn:
+            where = [*self._official_where(official_slots, slot), c.publication_claim_token == token,
+                     c.publication_claim_until > now, c.publication_status == "PUBLIC_READ_CONFIRMED",
+                     c.external_step == "FINALIZE",
+                     c.external_step_status.not_in(("CONFLICT", "HASH_MISMATCH"))]
+            raw = conn.execute(select(official_slots).where(*where).with_for_update()).mappings().first()
+            if raw is None:
+                return False
+            row = self._decode_publication(raw)
+            digest = row["batch_hash"]
+            archive, witness, read = (row[k] or {} for k in ("archive_receipt", "witness_receipt", "public_read_receipt"))
+            if (hashlib.sha256(bytes(row["batch_bytes"])).hexdigest() != digest
+                or archive.get("status") != "STORED" or archive.get("stored_hash") != digest
+                or witness.get("status") != "ACCEPTED" or witness.get("submitted_hash") != digest
+                or read.get("status") != "OK" or read.get("read_hash") != digest
+                or read.get("reference") != archive.get("public_reference")
+                or row["public_read_confirmed_at"] is None or row["public_read_confirmed_at"] > now
+                or row["witness_accepted_at"] is None):
+                conn.execute(official_slots.update().where(*where).values(
+                    external_step_status="HASH_MISMATCH", publication_error="PUBLICATION_EVIDENCE_INVALID",
+                    status="ERROR"))
+                return False
+            conn.execute(official_slots.update().where(*where).values(
+                publication_status="PUBLISHED", published_at=now, external_step="COMPLETE",
+                external_step_status="OK", publication_error=None,
+                status="PUBLISHED" if row["status"] == "BATCH_FROZEN" else row["status"],
+            ))
+            return True
+
+    def release_external_publication(self, slot, token):
+        with self.engine.begin() as conn:
+            conn.execute(official_slots.update().where(
+                *self._official_where(official_slots, slot), official_slots.c.publication_claim_token == token,
+            ).values(publication_claim_token=None, publication_claim_until=None))
+
+    def claim_post_publication_quote(self, slot, symbol, started_at):
+        if symbol not in publication.SYMBOLS:
+            raise ValueError("Unexpected official symbol")
+        with self._publication_transaction() as conn:
+            row = conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot)).with_for_update()).mappings().one()
+            if (row["publication_status"] != "PUBLISHED" or row["published_at"] is None
+                or started_at < row["published_at"]):
+                return False
+            quotes = json.loads(row["post_publish_quotes"] or "{}")
+            if symbol in quotes:
+                return False
+            quotes[symbol] = dict(status="REQUESTING", quote_kind="LIVE_AFTER_PUBLISH",
+                                  request_started_at=started_at, evidence_mode=row["publication_mode"],
+                                  provider="Binance Spot / data-api.binance.vision", endpoint=protocol.ENDPOINT)
+            conn.execute(official_slots.update().where(*self._official_where(official_slots, slot)).values(
+                post_publish_quotes=json.dumps(quotes, sort_keys=True),
+                post_publish_attempted=all(s in quotes for s in publication.SYMBOLS)))
+            return True
+
+    def finish_post_publication_quote(self, slot, symbol, received_at, *, data=None, error=None):
+        fields = protocol.normalize_quote(data, symbol) if data is not None else {}
+        with self._publication_transaction() as conn:
+            row = conn.execute(select(official_slots).where(
+                *self._official_where(official_slots, slot)).with_for_update()).mappings().one()
+            quotes = json.loads(row["post_publish_quotes"] or "{}")
+            quote = quotes.get(symbol)
+            if not quote or quote["status"] != "REQUESTING":
+                return False
+            if received_at < quote["request_started_at"]:
+                raise ValueError("Quote response precedes request")
+            quote.update(fields, status="OK" if data is not None else "QUOTE_FAILED",
+                         response_received_at=received_at, error=error)
+            conn.execute(official_slots.update().where(*self._official_where(official_slots, slot)).values(
+                post_publish_quotes=json.dumps(quotes, sort_keys=True)))
+            return True
 
     def prepare_publication_slot(self, now):
         """Activate once, journal missing elapsed hours, then prepare current hour.
@@ -440,7 +602,7 @@ class Store:
             ).values(last_checked_slot_utc=slot))
             row = conn.execute(select(official_slots).where(
                 *self._official_where(official_slots, slot))).mappings().one()
-            return dict(row)
+            return self._decode_publication(row)
 
     def freeze_publication_slot(self, slot, now, code_config, failures=None):
         """Freeze the first fixed BTC+ETH composition; retries return exact bytes."""
@@ -453,7 +615,7 @@ class Store:
             journal = conn.execute(select(official_slots).where(
                 *self._official_where(official_slots, slot)).with_for_update()).mappings().one()
             if journal["batch_bytes"] is not None or journal["status"] != "PREPARING":
-                return dict(journal)
+                return self._decode_publication(journal)
             c = strategy_forecasts.c
             rows = conn.execute(select(strategy_forecasts).where(
                 c.input_close_at == slot, c.strategy_id == journal["strategy_id"],
@@ -477,7 +639,7 @@ class Store:
                 status=status, batch_id=batch_id, batch_hash=digest, batch_bytes=raw,
                 frozen_at=now, publication_status="BATCH_FROZEN", error=error,
             ))
-            return dict(conn.execute(select(official_slots).where(
+            return self._decode_publication(conn.execute(select(official_slots).where(
                 *self._official_where(official_slots, slot))).mappings().one())
 
     def ready(self):
@@ -857,9 +1019,20 @@ class Store:
                                        target_observed_at=observed, result_status=timing,
                                        live_status="UNAVAILABLE")
                 if row["evaluation_version"] == publication.VERSION:
-                    # This phase has no external publisher or post-publication
-                    # quote. POST_RECORD_QUOTE must never score as LIVE.
                     protocol_values["live_status"] = "NOT_PUBLISHED_EXTERNALLY"
+                    journal = conn.execute(select(official_slots).where(
+                        *self._official_where(official_slots, row["input_close_at"]))).mappings().first()
+                    if journal and journal["publication_status"] == "PUBLISHED" and journal["published_at"] is not None:
+                        protocol_values.update(live_status="UNAVAILABLE",
+                                               live_evidence_mode=journal["publication_mode"])
+                        post_quote = json.loads(journal["post_publish_quotes"] or "{}").get(row["symbol"], {})
+                        if (post_quote.get("status") == "OK"
+                            and post_quote.get("quote_kind") == "LIVE_AFTER_PUBLISH"
+                            and post_quote.get("request_started_at", -1) >= journal["published_at"]
+                            and post_quote.get("response_received_at", row["due_at"]) < row["due_at"]):
+                            live = calculate(float(post_quote["mid_price"]))
+                            protocol_values.update(live_status=timing, live_change_pct=live["change_pct"],
+                                live_observed_direction=live["observed_direction"], live_correct=live["correct"])
                 quote = conn.execute(select(publish_observations).where(*[
                     publish_observations.c[k] == row[k] for k in PUBLISH_KEY
                 ])).mappings().first()

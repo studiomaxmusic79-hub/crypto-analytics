@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -7,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from . import krypta_strategy
 from . import evaluation_protocol as protocol
 from . import publication
+from .publication_adapters import PublicationWorkflow, publication_mode
 from .analytics import analyze, evaluate
 from .market import INTERVALS, MarketError
 from .market_inputs import input_hash, strategy_provenance
@@ -30,11 +32,24 @@ logger = logging.getLogger(__name__)
 
 
 class ForecastService:
-    def __init__(self, market, store, *, enable_krypta=False):
+    def __init__(self, market, store, *, enable_krypta=False,
+                 external_publication_mode=None, publication_adapters=None):
         self.market = market
         self.store = store
         # Only the standalone market_tick opts in; FastAPI keeps its old cycle.
         self.enable_krypta = enable_krypta
+        self.external_publication_mode = publication_mode(
+            external_publication_mode if external_publication_mode is not None else
+            os.getenv("EXTERNAL_PUBLICATION_MODE", "disabled") if enable_krypta else "disabled")
+        self.publication_workflow = None
+        if self.external_publication_mode == "mock":
+            if publication_adapters is None:
+                from .mock_publication import MockArchive, MockWitness, MockPublicReader
+                clock = lambda: int(time.time()*1000)
+                archive, witness = MockArchive(clock), MockWitness(clock)
+                publication_adapters = (archive, witness, MockPublicReader(archive, clock))
+            self.publication_workflow = PublicationWorkflow(
+                store, *publication_adapters, lambda: int(time.time()*1000), mode="mock")
         self.last_cycle_at = None
         self.errors = {}
 
@@ -342,6 +357,32 @@ class ForecastService:
                 })
         await asyncio.to_thread(self.store.save_strategy_forecasts, records)
         self.strategy_issued[symbol] = input_close_at
+
+    async def resume_publications(self):
+        if self.publication_workflow is None:
+            return
+        slots = await asyncio.to_thread(self.store.pending_publication_slots)
+        for slot in slots:
+            row = await self.publication_workflow.run(slot)
+            if row["publication_status"] != "PUBLISHED":
+                self.errors[f"publication:{slot}"] = row["publication_error"] or "Publication pending"
+                continue
+            self.errors.pop(f"publication:{slot}", None)
+            for symbol in publication.SYMBOLS:
+                started = int(time.time()*1000)
+                if not await asyncio.to_thread(self.store.claim_post_publication_quote, slot, symbol, started):
+                    continue
+                # Published transaction committed before the quote claim and HTTP.
+                try:
+                    data = await self.market.book_ticker(symbol)
+                    received = int(time.time()*1000)
+                    protocol.normalize_quote(data, symbol)
+                except Exception as exc:
+                    await asyncio.to_thread(self.store.finish_post_publication_quote, slot, symbol,
+                        int(time.time()*1000), error=f"{type(exc).__name__}: {exc}")
+                    continue
+                await asyncio.to_thread(self.store.finish_post_publication_quote, slot, symbol,
+                                        received, data=data)
 
     async def settle_strategies(self, now):
         rows = await asyncio.to_thread(self.store.pending_strategy_forecasts, now - 3000)
@@ -691,6 +732,9 @@ class ForecastService:
                 self.store.freeze_publication_slot, journal["slot_utc"],
                 int(time.time() * 1000), strategy_provenance(krypta_strategy), failures,
             )
+
+        if self.enable_krypta:
+            await self.resume_publications()
 
         self.errors.pop(
             "evaluation",

@@ -1,0 +1,19 @@
+# Local credentials and secret stores. No credentials are needed by mock mode.
+.env
+.env.*
+*.env
+secrets/
+credentials/
+.aws/
+.hedera/
+*credentials*.json
+*service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python runtime and local test artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
