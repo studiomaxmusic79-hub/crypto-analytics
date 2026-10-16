@@ -331,6 +331,15 @@ def forecasts(
     }
 
 
+@app.get("/api/strategy-forecasts")
+def strategy_forecasts(
+    request: Request,
+    symbol: Symbol = "BTCUSDT"
+):
+    symbol = normalize_symbol(symbol)
+    return request.app.state.store.strategy_history(symbol, limit=12)
+
+
 @app.get("/api/history")
 def history(
     request: Request,

@@ -61,3 +61,66 @@ def test_visitor_market_apis_only_read_shared_data_and_never_switch_collector(tm
         assert client.get('/api/forecasts').status_code == 200
         assert client.app.state.service.active_symbol == 'ETHUSDT'
         assert calls == []
+
+
+def test_strategy_forecasts_reads_latest_database_rows_without_binance(tmp_path, monkeypatch):
+    from test_strategy_storage import CLOSE, HOUR, record as strategy_record
+    monkeypatch.setenv('DATABASE_URL','sqlite:///'+str(tmp_path/'strategies.db'))
+    monkeypatch.delenv('RENDER',raising=False)
+    async def idle(self):
+        import asyncio
+        await asyncio.Event().wait()
+    monkeypatch.setattr(ForecastService,'run',idle)
+    with TestClient(app) as client:
+        calls = []
+        async def forbidden(*args, **kwargs):
+            calls.append((args,kwargs))
+            raise AssertionError('strategy API must never call Binance')
+        for method in ('ticker','klines','time_ms','target_price'):
+            monkeypatch.setattr(client.app.state.market,method,forbidden)
+        client.app.state.service.active_symbol = 'ETHUSDT'
+        store = client.app.state.store
+        history_calls = []
+        original = store.strategy_history
+        def history(symbol, **kwargs):
+            history_calls.append((symbol,kwargs))
+            return original(symbol,**kwargs)
+        monkeypatch.setattr(store,'strategy_history',history)
+
+        empty = client.get('/api/strategy-forecasts')
+        assert empty.status_code == 200
+        assert empty.json() == {'total':0,'items':[]}
+        records = []
+        for symbol, count in (('BTCUSDT',3),('ETHUSDT',1)):
+            for release in range(count):
+                closed = CLOSE+release*HOUR
+                for strategy_id in ('trend_breakout','trend_momentum','consensus'):
+                    for horizon in (1,4):
+                        records.append(strategy_record(
+                            symbol=symbol,strategy_id=strategy_id,horizon=horizon,
+                            input_close_at=closed,issued_at=closed+10_000,
+                            due_at=closed+horizon*HOUR,
+                        ))
+        store.save_strategy_forecasts(records)
+        response = client.get('/api/strategy-forecasts?symbol=BTCUSDT')
+        assert response.status_code == 200
+        data = response.json()
+        assert data['total'] == 18 and len(data['items']) == 12
+        assert {row['symbol'] for row in data['items']} == {'BTCUSDT'}
+        assert {row['strategy_id'] for row in data['items']} == {'trend_breakout','trend_momentum','consensus'}
+        assert {row['horizon'] for row in data['items']} == {1,4}
+        assert {row['input_close_at'] for row in data['items']} == {CLOSE+HOUR,CLOSE+2*HOUR}
+        assert data['items'][0]['input_close_at'] == CLOSE+2*HOUR
+        assert all(isinstance(row['reason_codes'],list) and isinstance(row['indicators'],dict)
+                   and row['evaluated_at'] is None for row in data['items'])
+        assert response.headers['cache-control'] == 'no-store'
+        eth = client.get('/api/strategy-forecasts?symbol=eth%2Fusdt').json()
+        assert eth['total'] == 6
+        assert {row['symbol'] for row in eth['items']} == {'ETHUSDT'}
+        assert history_calls[-1] == ('ETHUSDT',{'limit':12})
+        assert client.get('/api/strategy-forecasts?symbol=BAD').status_code == 400
+        assert client.post('/api/strategy-forecasts',json={}).status_code == 405
+        assert client.get('/api/forecasts').json() == {'items':[]}
+        assert client.app.state.service.active_symbol == 'ETHUSDT'
+        assert calls == []
+        assert store.strategy_history('BTCUSDT')['total'] == 18
