@@ -549,6 +549,8 @@ canvas{
 
 .forecast-top{
   display:flex;
+  flex-wrap:wrap;
+  gap:7px 12px;
   align-items:center;
   justify-content:space-between;
   margin-bottom:10px
@@ -560,8 +562,8 @@ canvas{
 }
 
 .forecast-target{
-  font-size:8px;
-  color:#9ca5ab
+  font-size:14px;
+  color:#202020
 }
 
 .forecast-direction{
@@ -580,24 +582,24 @@ canvas{
 
 .direction-detail{
   margin-left:auto;
-  font-size:8px;
-  color:#8d989f;
+  font-size:14px;
+  color:#202020;
   text-align:right;
-  max-width:70px;
+  max-width:110px;
   line-height:1.6
 }
 
 .signal-strength{
   display:flex;
   justify-content:space-between;
-  font-size:9px;
-  color:#88959c;
+  font-size:14px;
+  color:#202020;
   margin:13px 0 7px
 }
 
 .signal-strength strong{
   font-weight:500;
-  color:#536a62
+  color:#202020
 }
 
 .strength-track{
@@ -617,9 +619,10 @@ canvas{
 .strength-track.wait i.filled{background:#c8bb89}
 
 .reasons{
-  font-size:9px;
+  font-size:14px;
   line-height:1.7;
-  color:#83918a;
+  color:#202020;
+  overflow-wrap:anywhere;
   margin:10px 0 0
 }
 
@@ -634,19 +637,24 @@ canvas{
 }
 
 .signal-disclaimer>span{
-  color:#98a39f;
-  font-size:12px
+  color:#202020;
+  font-size:14px
 }
 
 .signal-disclaimer p{
-  font-size:8px;
+  font-size:14px;
   line-height:1.8;
-  color:#909b98
+  color:#202020
 }
 
 .signal-disclaimer strong{
   font-weight:500;
-  color:#6f817a
+  color:#202020
+}
+
+.signals-panel .empty{
+  font-size:14px;
+  color:#202020
 }
 
 .stats-grid{
@@ -1182,7 +1190,7 @@ footer{
 
   .forecast-list{
     display:grid;
-    grid-template-columns:1fr 1fr;
+    grid-template-columns:repeat(2,minmax(0,1fr));
     padding:0 17px
   }
 
@@ -1207,13 +1215,10 @@ footer{
   .horizon-label{font-size:11px}
   .direction-label,.direction-icon{font-size:24px}
   .direction-detail{display:none}
-  .reasons{font-size:8px}
 
   .signal-disclaimer{
     margin:0 17px 16px
   }
-
-  .signal-disclaimer p{font-size:9px}
 
   .stats-grid{
     grid-template-columns:1fr 1fr;
