@@ -16,12 +16,14 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from .market import BinanceMarket, MarketError
-from .service import ForecastService
+from .service import CANDLE_REFRESH_MS, ForecastService
 from .storage import Store
 
 
 STATIC = Path(__file__).parent / "static"
 Symbol = str
+QUOTE_MAX_AGE_MS = 6 * 60_000
+CANDLE_GRACE_MS = 4 * 60_000
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -49,17 +51,34 @@ def normalize_symbol(symbol: str) -> str:
     return symbol
 
 
-def activate_symbol(
-    request: Request,
-    symbol: str
-) -> str:
-    symbol = normalize_symbol(symbol)
+def stored_quote(store: Store, symbol: str):
+    ticker = store.get_quote(symbol)
 
-    request.app.state.service.set_active_symbol(
-        symbol
-    )
+    if ticker is None:
+        raise HTTPException(
+            503,
+            f"В базе пока нет котировки {symbol}. "
+            "Дождитесь фонового обновления данных."
+        )
 
-    return symbol
+    now = int(time.time() * 1000)
+    if (
+        now - ticker["fetched_at"] > QUOTE_MAX_AGE_MS
+        or now - ticker["updated_at"] > QUOTE_MAX_AGE_MS + 120_000
+    ):
+        raise HTTPException(
+            503,
+            f"Сохранённая котировка {symbol} устарела. "
+            "Ожидается фоновое обновление данных."
+        )
+
+    # Сохраняем прежний формат ticker(), без служебного fetched_at.
+    return {
+        key: ticker[key]
+        for key in (
+            "symbol", "price", "change_pct", "high", "low", "volume", "updated_at"
+        )
+    }
 
 
 @asynccontextmanager
@@ -235,7 +254,7 @@ def status(
 
 
 @app.get("/api/market")
-async def market(
+def market(
     request: Request,
     symbol: Symbol = "BTCUSDT",
     interval: Literal[
@@ -244,56 +263,46 @@ async def market(
         "4h"
     ] = "1h"
 ):
-    # Выбранная пользователем монета
-    # становится активной для фонового
-    # расчёта прогнозов.
-    symbol = activate_symbol(
-        request,
-        symbol
-    )
-
-    market = request.app.state.market
-
-    # Эти данные кэшируются
-    # в market.py.
-    ticker = await market.ticker(
-        symbol
-    )
-
-    candles = await market.klines(
+    symbol = normalize_symbol(symbol)
+    store = request.app.state.store
+    ticker = stored_quote(store, symbol)
+    candles = store.get_candles(
         symbol,
         interval,
         limit=200
     )
 
     if not candles:
-        raise MarketError(
-            "Binance не вернул свечи "
-            "для графика. "
-            "Повторим запрос позже."
+        raise HTTPException(
+            503,
+            f"В базе пока нет свечей {symbol} ({interval}) для графика. "
+            "Дождитесь фонового обновления данных."
+        )
+
+    now = int(time.time() * 1000)
+    updated_at = request.app.state.service.candle_updates.get((symbol, interval))
+    max_age = CANDLE_REFRESH_MS[interval] + CANDLE_GRACE_MS
+    if (
+        updated_at is None
+        or now - updated_at > max_age
+        or now - candles[-1]["close_time"] > max_age
+    ):
+        raise HTTPException(
+            503,
+            f"Свечи {symbol} ({interval}) устарели или ещё не подтверждены "
+            "после запуска. Ожидается фоновое обновление данных."
         )
 
     return {
         "ticker": ticker,
         "interval": interval,
         "source": "Binance",
-        "candles": [
-            {
-                "time": int(c[0]),
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-                "volume": float(c[5]),
-                "close_time": int(c[6])
-            }
-            for c in candles
-        ]
+        "candles": candles
     }
 
 
 @app.get("/api/quote")
-async def quote(
+def quote(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
@@ -301,13 +310,7 @@ async def quote(
         symbol
     )
 
-    # Только цена выбранной валюты.
-    # ticker() кэшируется в market.py.
-    return await (
-        request.app.state
-        .market
-        .ticker(symbol)
-    )
+    return stored_quote(request.app.state.store, symbol)
 
 
 @app.get("/api/forecasts")
@@ -315,10 +318,7 @@ def forecasts(
     request: Request,
     symbol: Symbol = "BTCUSDT"
 ):
-    symbol = activate_symbol(
-        request,
-        symbol
-    )
+    symbol = normalize_symbol(symbol)
 
     # Здесь Binance не вызывается.
     # Браузер читает уже готовые

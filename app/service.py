@@ -5,6 +5,15 @@ from .analytics import analyze, evaluate
 from .market import INTERVALS, MarketError
 
 
+SYMBOLS = ("BTCUSDT", "ETHUSDT")
+CANDLE_REFRESH_MS = {
+    "15m": 5 * 60_000,
+    "1h": 15 * 60_000,
+    "4h": 30 * 60_000,
+}
+HISTORY_BARS = 200
+
+
 class ForecastService:
     def __init__(self, market, store):
         self.market = market
@@ -12,8 +21,12 @@ class ForecastService:
         self.last_cycle_at = None
         self.errors = {}
 
-        # Валюта, для которой сейчас нужен
-        # автоматический расчёт прогнозов.
+        self.collected_slots = {}
+        # Время Binance до запроса; отмечаем только после успешной записи.
+        # После перезапуска свечи должны быть подтверждены заново.
+        self.candle_updates = {}
+
+        # Совместимость с main.py. На фоновую работу не влияет.
         self.active_symbol = "BTCUSDT"
 
     def set_active_symbol(self, symbol):
@@ -25,6 +38,100 @@ class ForecastService:
             )
 
         self.active_symbol = symbol
+
+    @staticmethod
+    def candle_values(candles):
+        return [
+            {
+                "time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+                "close_time": int(c[6]),
+            }
+            for c in candles
+        ]
+
+    @staticmethod
+    def analysis_values(candles):
+        return [
+            [c["time"], c["open"], c["high"], c["low"],
+             c["close"], c["volume"], c["close_time"]]
+            for c in candles
+        ]
+
+    async def collect_quote(self, symbol):
+        quote = await self.market.ticker(symbol)
+        await asyncio.to_thread(
+            self.store.save_quote,
+            {**quote, "fetched_at": int(time.time() * 1000)},
+        )
+
+    async def collect_candles(self, symbol, interval, now):
+        key = (symbol, interval)
+        refresh_slot = now // CANDLE_REFRESH_MS[interval]
+        if self.collected_slots.get(key) == refresh_slot:
+            return
+
+        stored = await asyncio.to_thread(
+            self.store.get_candles, symbol, interval, HISTORY_BARS
+        )
+        delta = INTERVALS[interval]
+        expected_open = now // delta * delta
+        complete = (
+            len(stored) == HISTORY_BARS
+            and all(
+                b["time"] - a["time"] == delta
+                for a, b in zip(stored, stored[1:])
+            )
+        )
+        # При запуске загружаем окно; далее обновляем последнюю свечу
+        # и все появившиеся после неё, включая пропущенные при остановке.
+        limit = HISTORY_BARS
+        if key in self.collected_slots and complete:
+            limit = min(
+                HISTORY_BARS,
+                max(2, (expected_open - stored[-1]["time"]) // delta + 1),
+            )
+
+        async def fetch(count):
+            # endTime также отключает короткий кэш клиента: подтверждение
+            # закрытия должно основываться на новом ответе Binance.
+            rows = await self.market.klines(
+                symbol, interval, limit=count, endTime=now
+            )
+            return self.candle_values(rows)
+
+        def usable(values, count):
+            merged = {c["time"]: c for c in stored}
+            merged.update({c["time"]: c for c in values})
+            window = sorted(merged.values(), key=lambda c: c["time"])[-HISTORY_BARS:]
+            return (
+                len(values) == count
+                and len(window) == HISTORY_BARS
+                and values[-1]["time"] == expected_open
+                and all(
+                    b["time"] - a["time"] == delta
+                    for a, b in zip(values, values[1:])
+                )
+                and all(
+                    b["time"] - a["time"] == delta
+                    for a, b in zip(window, window[1:])
+                )
+            )
+
+        values = await fetch(limit)
+        if not usable(values, limit) and limit != HISTORY_BARS:
+            values = await fetch(HISTORY_BARS)
+            limit = HISTORY_BARS
+        if not usable(values, limit):
+            raise MarketError("Неполная или устаревшая история свечей")
+
+        await asyncio.to_thread(self.store.save_candles, symbol, interval, values)
+        self.collected_slots[key] = refresh_slot
+        self.candle_updates[key] = now
 
     async def generate(self, symbol, now):
         slot = now // 900_000
@@ -47,10 +154,18 @@ class ForecastService:
         if not missing:
             return
 
+        for interval in {"15m" if h in (30, 1) else "1h" for h in missing}:
+            expected_close = now // INTERVALS[interval] * INTERVALS[interval]
+            if self.candle_updates.get((symbol, interval), -1) < expected_close:
+                raise MarketError(
+                    f"Закрытые свечи {symbol} ({interval}) ещё не подтверждены "
+                    "обновлением Binance. Прогноз будет рассчитан позже."
+                )
+
         recent = await self.market.klines(
             symbol,
             "1m",
-            limit=3
+            limit=2
         )
 
         closed = [
@@ -73,6 +188,13 @@ class ForecastService:
                 "прогноз не сформирован"
             )
 
+        # Формирующуюся минутную свечу не сохраняем: её незавершённая
+        # цена не должна позже использоваться как результат прогноза.
+        await asyncio.to_thread(
+            self.store.save_candles, symbol, "1m", self.candle_values(closed)
+        )
+
+        inputs = {}
         for horizon in missing:
             # 30 минут и 1 час анализируем
             # по 15-минутным свечам.
@@ -83,12 +205,13 @@ class ForecastService:
                 else "1h"
             )
 
-            candles = await self.market.klines(
-                symbol,
-                interval,
-                limit=120,
-                endTime=reference_at - 1
-            )
+            if interval not in inputs:
+                saved = await asyncio.to_thread(
+                    self.store.get_candles, symbol, interval, HISTORY_BARS
+                )
+                inputs[interval] = self.analysis_values(saved)
+
+            candles = inputs[interval]
 
             candles = [
                 c
@@ -161,13 +284,28 @@ class ForecastService:
             now - 3000
         )
 
+        prices = {}
+        minute_candles = {}
         for row in rows:
             try:
-                price = await self.market.target_price(
-                    row["symbol"],
-                    row["due_at"],
-                    now
-                )
+                symbol = row["symbol"]
+                key = (symbol, row["due_at"])
+                if symbol not in minute_candles:
+                    saved = await asyncio.to_thread(
+                        self.store.get_candles, symbol, "1m", 1000
+                    )
+                    minute_candles[symbol] = {
+                        c["time"]: c for c in saved
+                    }
+                if key not in prices:
+                    candle = minute_candles[symbol].get(row["due_at"] - 60_000)
+                    if candle and candle["close_time"] == row["due_at"] - 1:
+                        prices[key] = candle["close"]
+                    else:
+                        prices[key] = await self.market.target_price(
+                            symbol, row["due_at"], now
+                        )
+                price = prices[key]
 
                 if price is None:
                     await asyncio.to_thread(
@@ -214,27 +352,22 @@ class ForecastService:
             None
         )
 
-        # Вместо постоянного расчёта сразу
-        # BTC и ETH работаем только с той валютой,
-        # которая сейчас выбрана пользователем.
-        symbol = self.active_symbol
-
-        try:
-            await self.generate(
-                symbol,
-                now
-            )
-
-            self.errors.pop(
-                symbol,
-                None
-            )
-
-        except (
-            MarketError,
-            ValueError
-        ) as exc:
-            self.errors[symbol] = str(exc)
+        for symbol in SYMBOLS:
+            jobs = [
+                (f"{symbol}:quote", self.collect_quote, (symbol,)),
+                *[
+                    (f"{symbol}:{interval}", self.collect_candles,
+                     (symbol, interval, now))
+                    for interval in CANDLE_REFRESH_MS
+                ],
+                (symbol, self.generate, (symbol, now)),
+            ]
+            for key, operation, args in jobs:
+                try:
+                    await operation(*args)
+                    self.errors.pop(key, None)
+                except (MarketError, ValueError) as exc:
+                    self.errors[key] = str(exc)
 
         self.errors.pop(
             "evaluation",

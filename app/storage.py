@@ -46,6 +46,34 @@ forecasts = Table(
 )
 
 
+market_quotes = Table(
+    "market_quotes",
+    metadata,
+    Column("symbol", String(12), primary_key=True),
+    Column("price", Float, nullable=False),
+    Column("change_pct", Float, nullable=False),
+    Column("high", Float, nullable=False),
+    Column("low", Float, nullable=False),
+    Column("volume", Float, nullable=False),
+    Column("updated_at", BigInteger, nullable=False),
+    Column("fetched_at", BigInteger, nullable=False),
+)
+
+market_candles = Table(
+    "market_candles",
+    metadata,
+    Column("symbol", String(12), primary_key=True),
+    Column("interval", String(4), primary_key=True),
+    Column("time", BigInteger, primary_key=True),
+    Column("open", Float, nullable=False),
+    Column("high", Float, nullable=False),
+    Column("low", Float, nullable=False),
+    Column("close", Float, nullable=False),
+    Column("volume", Float, nullable=False),
+    Column("close_time", BigInteger, nullable=False),
+)
+
+
 def database_url():
     url = os.getenv("DATABASE_URL", "")
 
@@ -105,6 +133,94 @@ class Store:
     def ready(self):
         with self.engine.connect() as conn:
             conn.execute(select(1))
+
+    def save_quote(self, quote):
+        """Insert or replace the latest quote; timestamps are UTC milliseconds."""
+        insert = (
+            sqlite_insert
+            if self.engine.dialect.name == "sqlite"
+            else pg_insert
+        )
+        statement = insert(market_quotes)
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["symbol"],
+                    set_={
+                        column.name: statement.excluded[column.name]
+                        for column in market_quotes.c
+                        if column.name != "symbol"
+                    },
+                ),
+                dict(quote),
+            )
+
+    def get_quote(self, symbol):
+        """Return the saved quote, or None when no quote has been collected."""
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(market_quotes)
+                .where(market_quotes.c.symbol == symbol)
+            ).first()
+
+        return dict(row._mapping) if row is not None else None
+
+    def save_candles(self, symbol, interval, candles):
+        """Upsert candle dictionaries in one transaction, including open candles."""
+        fields = (
+            "time", "open", "high", "low", "close", "volume", "close_time"
+        )
+        values = [
+            {
+                **{field: candle[field] for field in fields},
+                "symbol": symbol,
+                "interval": interval,
+            }
+            for candle in candles
+        ]
+
+        if not values:
+            return
+
+        insert = (
+            sqlite_insert
+            if self.engine.dialect.name == "sqlite"
+            else pg_insert
+        )
+        statement = insert(market_candles)
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["symbol", "interval", "time"],
+                    set_={
+                        field: statement.excluded[field]
+                        for field in fields
+                        if field != "time"
+                    },
+                ),
+                values,
+            )
+
+    def get_candles(self, symbol, interval, limit=200):
+        """Return the latest candles in chronological order, or an empty list."""
+        if not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer between 1 and 1000")
+
+        c = market_candles.c
+
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    c.time, c.open, c.high, c.low, c.close, c.volume, c.close_time
+                )
+                .where(c.symbol == symbol, c.interval == interval)
+                .order_by(c.time.desc())
+                .limit(limit)
+            ).all()
+
+        return [dict(row._mapping) for row in reversed(rows)]
 
     def has_slot(self, symbol, horizon, slot):
         with self.engine.connect() as conn:
