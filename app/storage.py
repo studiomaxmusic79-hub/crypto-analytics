@@ -1,9 +1,10 @@
 import json
+import math
 import os
 from pathlib import Path
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, BigInteger,
-    String, Float, Text, Boolean, UniqueConstraint,
+    String, Float, Text, Boolean, UniqueConstraint, CheckConstraint,
     select, func, case, and_
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -71,6 +72,72 @@ market_candles = Table(
     Column("close", Float, nullable=False),
     Column("volume", Float, nullable=False),
     Column("close_time", BigInteger, nullable=False),
+)
+
+
+STRATEGY_FORECAST_KEY = (
+    "symbol", "input_close_at", "strategy_id", "strategy_version", "horizon"
+)
+
+# LIVE records only. BACKTEST issuance is intentionally not enabled by this
+# schema: the actual issue time must be within five minutes of the hourly close.
+strategy_forecasts = Table(
+    "strategy_forecasts",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("symbol", String(12), nullable=False),
+    Column("strategy_id", String(64), nullable=False),
+    Column("strategy_version", String(32), nullable=False),
+    Column("input_close_at", BigInteger, nullable=False),
+    Column("horizon", Integer, nullable=False),
+    Column("issued_at", BigInteger, nullable=False),
+    Column("base_price", Float),
+    Column("due_at", BigInteger, nullable=False, index=True),
+    Column("status", String(20), nullable=False),
+    Column("direction", String(4)),
+    Column("score", Float),
+    Column("reason_codes", Text, nullable=False),
+    Column("indicators", Text, nullable=False),
+    Column("evaluation_version", String(32), nullable=False),
+    Column("neutral_pct", Float),
+    Column("actual_price", Float),
+    Column("change_pct", Float),
+    Column("observed_direction", String(4)),
+    Column("correct", Boolean),
+    Column("evaluated_at", BigInteger),
+    Column("evaluation_note", Text),
+    Column("last_attempt_at", BigInteger),
+    UniqueConstraint(*STRATEGY_FORECAST_KEY, name="unique_strategy_forecast"),
+    CheckConstraint("horizon IN (1, 4)", name="strategy_horizon"),
+    CheckConstraint(
+        "input_close_at % 3600000 = 0 AND "
+        "due_at = input_close_at + horizon * 3600000",
+        name="strategy_hourly_target",
+    ),
+    CheckConstraint(
+        "issued_at >= input_close_at AND issued_at <= input_close_at + 300000",
+        name="strategy_live_window",
+    ),
+    CheckConstraint(
+        "(status = 'OK' AND direction IS NOT NULL "
+        "AND direction IN ('UP', 'DOWN', 'WAIT') AND score IS NOT NULL "
+        "AND base_price IS NOT NULL AND base_price > 0 "
+        "AND neutral_pct IS NOT NULL AND neutral_pct >= 0.10) OR "
+        "(status IN ('SKIPPED', 'DATA_UNAVAILABLE') "
+        "AND direction IS NULL AND score IS NULL)",
+        name="strategy_decision_shape",
+    ),
+    CheckConstraint(
+        "(evaluated_at IS NULL AND actual_price IS NULL AND change_pct IS NULL "
+        "AND observed_direction IS NULL AND correct IS NULL) OR "
+        "(status = 'OK' AND evaluated_at IS NOT NULL AND evaluated_at >= due_at "
+        "AND actual_price IS NOT NULL AND actual_price > 0 "
+        "AND change_pct IS NOT NULL AND observed_direction IS NOT NULL "
+        "AND observed_direction IN ('UP', 'DOWN', 'FLAT') "
+        "AND ((direction = 'WAIT' AND correct IS NULL) OR "
+        "(direction IN ('UP', 'DOWN') AND correct IS NOT NULL)))",
+        name="strategy_evaluation_shape",
+    ),
 )
 
 
@@ -221,6 +288,174 @@ class Store:
             ).all()
 
         return [dict(row._mapping) for row in reversed(rows)]
+
+    def save_strategy_forecasts(self, records):
+        """Atomically insert a batch; exact retries are no-ops, conflicts raise.
+
+        Only original decision fields are accepted. Evaluation is added through
+        resolve_strategy_forecast(), never through a replacement/upsert.
+        """
+        result_fields = {
+            "id", "actual_price", "change_pct", "observed_direction", "correct",
+            "evaluated_at", "evaluation_note", "last_attempt_at",
+        }
+        fields = {c.name for c in strategy_forecasts.c} - result_fields
+        prepared = []
+        contexts = {}
+        for record in records:
+            values = dict(record)
+            if set(values) != fields:
+                raise ValueError("Provide exactly the original strategy forecast fields")
+            for key in ("input_close_at", "issued_at", "due_at", "horizon"):
+                if type(values[key]) is not int:
+                    raise ValueError(f"{key} must be an integer")
+            for key in ("symbol", "strategy_id", "strategy_version", "evaluation_version"):
+                if not isinstance(values[key], str) or not values[key].strip():
+                    raise ValueError(f"{key} must be a nonempty string")
+            for key in ("base_price", "score", "neutral_pct"):
+                value = values[key]
+                if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                ):
+                    raise ValueError(f"{key} must be finite or None")
+            if not isinstance(values["reason_codes"], list) or not all(
+                isinstance(code, str) for code in values["reason_codes"]
+            ) or not isinstance(values["indicators"], dict):
+                raise ValueError("reason_codes must be a string list and indicators a dict")
+            group = (values["symbol"], values["input_close_at"])
+            context = (values["issued_at"], values["base_price"])
+            if group in contexts and contexts[group] != context:
+                raise ValueError("A batch must share issue time and hourly base price")
+            contexts[group] = context
+            for key in ("reason_codes", "indicators"):
+                values[key] = json.dumps(
+                    values[key], ensure_ascii=False, allow_nan=False, sort_keys=True
+                )
+            prepared.append(values)
+
+        if not prepared:
+            return 0
+
+        insert = sqlite_insert if self.engine.dialect.name == "sqlite" else pg_insert
+        inserted = 0
+        with self.engine.begin() as conn:
+            for values in prepared:
+                forecast_id = conn.execute(
+                    insert(strategy_forecasts).values(**values)
+                    .on_conflict_do_nothing(index_elements=list(STRATEGY_FORECAST_KEY))
+                    .returning(strategy_forecasts.c.id)
+                ).scalar_one_or_none()
+                if forecast_id is not None:
+                    inserted += 1
+                    continue
+                existing = conn.execute(
+                    select(strategy_forecasts).where(*[
+                        strategy_forecasts.c[key] == values[key]
+                        for key in STRATEGY_FORECAST_KEY
+                    ])
+                ).mappings().one()
+                if any(existing[key] != value for key, value in values.items()):
+                    raise ValueError("A published strategy forecast cannot be overwritten")
+        return inserted
+
+    @staticmethod
+    def _decode_strategy(row):
+        values = dict(row._mapping)
+        for key in ("reason_codes", "indicators"):
+            values[key] = json.loads(values[key])
+        return values
+
+    def has_strategy_forecast(self, symbol, input_close_at, strategy_id,
+                              strategy_version, horizon):
+        values = (symbol, input_close_at, strategy_id, strategy_version, horizon)
+        with self.engine.connect() as conn:
+            return conn.execute(
+                select(strategy_forecasts.c.id).where(*[
+                    strategy_forecasts.c[key] == value
+                    for key, value in zip(STRATEGY_FORECAST_KEY, values)
+                ])
+            ).first() is not None
+
+    def strategy_history(self, symbol, strategy_id=None, horizon=None,
+                         offset=0, limit=100, strategy_version=None):
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be nonnegative")
+        if horizon is not None and (type(horizon) is not int or horizon not in (1, 4)):
+            raise ValueError("horizon must be 1 or 4")
+        c = strategy_forecasts.c
+        where = [c.symbol == symbol]
+        for column, value in ((c.strategy_id, strategy_id), (c.horizon, horizon),
+                              (c.strategy_version, strategy_version)):
+            if value is not None:
+                where.append(column == value)
+        with self.engine.connect() as conn:
+            total = conn.execute(
+                select(func.count()).select_from(strategy_forecasts).where(*where)
+            ).scalar_one()
+            rows = conn.execute(
+                select(strategy_forecasts).where(*where)
+                .order_by(c.input_close_at.desc(), c.id.desc())
+                .offset(offset).limit(limit)
+            ).all()
+        return {"total": total, "items": [self._decode_strategy(row) for row in rows]}
+
+    def pending_strategy_forecasts(self, now, limit=100):
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        c = strategy_forecasts.c
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(strategy_forecasts)
+                .where(c.status == "OK", c.due_at <= now, c.evaluated_at.is_(None))
+                .order_by(c.last_attempt_at.asc().nullsfirst(), c.due_at, c.id)
+                .limit(limit)
+            ).all()
+        return [self._decode_strategy(row) for row in rows]
+
+    def resolve_strategy_forecast(self, forecast_id, evaluation, now):
+        """Append the first completed evaluation; decision fields never change."""
+        c = strategy_forecasts.c
+        pending = (c.id == forecast_id, c.status == "OK", c.evaluated_at.is_(None))
+        with self.engine.begin() as conn:
+            row = conn.execute(select(strategy_forecasts).where(*pending)).mappings().first()
+            if row is None:
+                return False
+            if type(now) is not int or now < row["due_at"]:
+                raise ValueError("Cannot evaluate before the target hourly close")
+            if evaluation.get("status", "OK") != "OK":
+                raise ValueError("Only a completed evaluation can be saved")
+            values = {key: evaluation[key] for key in (
+                "actual_price", "change_pct", "observed_direction"
+            )}
+            for key in ("actual_price", "change_pct"):
+                value = values[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f"{key} must be finite")
+            if values["actual_price"] <= 0 or values["observed_direction"] not in ("UP", "DOWN", "FLAT"):
+                raise ValueError("Invalid actual price or observed direction")
+            # Never trust a caller's correct=True for WAIT or a mismatched vote.
+            values["correct"] = (
+                None if row["direction"] == "WAIT"
+                else row["direction"] == values["observed_direction"]
+            )
+            result = conn.execute(
+                strategy_forecasts.update().where(*pending)
+                .values(**values, evaluated_at=now, evaluation_note=None)
+            )
+            return result.rowcount == 1
+
+    def note_strategy_forecast(self, forecast_id, note, now):
+        c = strategy_forecasts.c
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                strategy_forecasts.update()
+                .where(c.id == forecast_id, c.status == "OK", c.evaluated_at.is_(None))
+                .values(evaluation_note=note, last_attempt_at=now)
+            )
+            return result.rowcount == 1
 
     def has_slot(self, symbol, horizon, slot):
         with self.engine.connect() as conn:

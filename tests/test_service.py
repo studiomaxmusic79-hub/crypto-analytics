@@ -22,14 +22,20 @@ def test_no_future_candles_and_no_retrospective_generation(tmp_path, monkeypatch
             return data
     store = Store('sqlite:///' + str(tmp_path/'test.db')); store.init()
     service = ForecastService(FakeMarket(), store)
+    # Generation now consumes the shared, successfully refreshed Store window.
+    for interval in ('15m', '1h'):
+        data = asyncio.run(service.market.klines('BTCUSDT', interval, 120))
+        store.save_candles('BTCUSDT', interval, service.candle_values(data))
+        service.candle_updates[('BTCUSDT', interval)] = now
     asyncio.run(service.generate('BTCUSDT', now))
     rows = store.latest('BTCUSDT')
-    assert len(rows) == 2
+    assert len(rows) == 3
     assert all(r['issued_at'] == now and r['slot'] == now//900_000 for r in rows)
     assert all(r['reference_at'] == 180_000_000 for r in rows)
-    assert rows[0]['indicators'] == __import__('app.analytics',fromlist=['analyze']).analyze(candles(1),1)['indicators']
+    hourly = next(r for r in rows if r['horizon'] == 1)
+    assert hourly['indicators'] == __import__('app.analytics',fromlist=['analyze']).analyze(candles(1),1)['indicators']
     asyncio.run(service.generate('BTCUSDT', now))
-    assert store.history('BTCUSDT')['total'] == 2
+    assert store.history('BTCUSDT')['total'] == 3
     store.close()
 
 
@@ -58,7 +64,9 @@ def test_stale_market_does_not_create_predictions(tmp_path):
         async def klines(self, *args, **kwargs):
             return [[0,'100','101','99','100','10',59_999]]
     store = Store('sqlite:///' + str(tmp_path/'test.db')); store.init()
+    service = ForecastService(FakeMarket(),store)
+    service.candle_updates.update({('BTCUSDT', interval): 180_000_000 for interval in ('15m', '1h')})
     with pytest.raises(MarketError, match='устарели'):
-        asyncio.run(ForecastService(FakeMarket(),store).generate('BTCUSDT',180_000_000))
+        asyncio.run(service.generate('BTCUSDT',180_000_000))
     assert store.history('BTCUSDT')['total'] == 0
     store.close()

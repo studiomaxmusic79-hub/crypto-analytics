@@ -29,8 +29,8 @@ def test_rate_limit_stops_followup_requests():
             calls.append(request)
             return httpx.Response(429,headers={'Retry-After':'60'})
         market.client = httpx.AsyncClient(base_url='https://data-api.binance.vision',transport=httpx.MockTransport(handler))
-        for _ in range(2):
-            with pytest.raises(MarketError,match='частоту'):
+        for message in ('Binance rate limit', 'cooldown'):
+            with pytest.raises(MarketError,match=message):
                 await market.time_ms()
         assert len(calls) == 1
         await market.close()
