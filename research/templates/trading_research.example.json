@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "experiment_id": "EXAMPLE-trading-v2-not-a-real-experiment",
+  "study_family_id": "EXAMPLE-btc-context-eth-momentum",
+  "influenced_by_experiment_ids": ["EXAMPLE-trading-v1-prior-viewed-result"],
+  "experiment_type": "TRADING_RESEARCH",
+  "hypothesis": "EXAMPLE ONLY: BTC context improves a simple ETH momentum trading strategy after costs.",
+  "strategy_id": "EXAMPLE_BTC_CONTEXT_ETH_MOMENTUM",
+  "strategy_version": "EXAMPLE_REPLACE_WITH_FROZEN_VERSION",
+  "code_commit_sha": "EXAMPLE_REPLACE_WITH_ACTUAL_COMMIT_SHA",
+  "config_hash": "EXAMPLE_REPLACE_WITH_ACTUAL_CONFIG_HASH",
+  "dataset_id": "EXAMPLE_REPLACE_WITH_FROZEN_DATASET_ID",
+  "dataset_hash": "EXAMPLE_REPLACE_WITH_ACTUAL_DATASET_HASH",
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "development_period": {"start": "2000-01-01", "end": "2001-01-01"},
+  "validation_period": {"start": "2001-01-01", "end": "2002-01-01"},
+  "final_test_period": {"start": "2002-01-01", "end": "2003-01-01"},
+  "evaluator_version": "EXAMPLE_TRADING_EVALUATOR_NOT_IMPLEMENTED_BY_THIS_TEMPLATE",
+  "benchmarks": ["EXAMPLE_ETH_MOMENTUM_WITHOUT_BTC_CONTEXT"],
+  "primary_endpoint": "EXAMPLE_net_full_capital_return_excess_pp_vs_ETH_momentum_without_BTC_context",
+  "secondary_endpoints": ["EXAMPLE_max_drawdown_pct", "EXAMPLE_net_PnL"],
+  "metrics": [
+    "EXAMPLE_net_PnL_after_all_costs",
+    "EXAMPLE_return_pct_on_total_allocated_capital",
+    "EXAMPLE_max_drawdown_pct",
+    "EXAMPLE_exposure",
+    "EXAMPLE_time_in_market_pct",
+    "EXAMPLE_turnover",
+    "EXAMPLE_commissions",
+    "EXAMPLE_spread_and_slippage_costs",
+    "EXAMPLE_benchmark_return_excess_pp"
+  ],
+  "acceptance_criteria": {
+    "example_only": true,
+    "primary_min_net_full_capital_return_excess_pp": 1.0,
+    "max_drawdown_pct_limit": 15.0,
+    "required_before_real_registration": [
+      "Specify execution instrument and venue including spot/derivative and financing assumptions",
+      "Specify fees and commission model",
+      "Specify spread model and slippage model",
+      "Specify execution delay and first actually available entry price",
+      "Specify position size and total allocated capital",
+      "Specify exit rules and ambiguous intrabar event handling",
+      "Specify full-capital return calculation including idle capital",
+      "Specify mark-to-market drawdown calculation and limit",
+      "Specify benchmark position mapping, comparable costs and uncertainty method",
+      "Replace all illustrative thresholds and placeholders before any real run"
+    ]
+  },
+  "execution_assumptions": {
+    "execution_instrument": "EXAMPLE_REPLACE_WITH_INSTRUMENT_AND_VENUE",
+    "commission_model": "EXAMPLE_REPLACE_WITH_FEES_PER_SIDE",
+    "spread_model": "EXAMPLE_REPLACE_WITH_SPREAD_MODEL",
+    "slippage_model": "EXAMPLE_REPLACE_WITH_SLIPPAGE_MODEL",
+    "execution_delay": "EXAMPLE_REPLACE_WITH_EXPLICIT_DELAY",
+    "position_size": "EXAMPLE_REPLACE_WITH_SIZING_RULE_AND_CAPITAL",
+    "exit_rules": "EXAMPLE_REPLACE_WITH_FROZEN_EXIT_RULES",
+    "intrabar_policy": "EXAMPLE: conservative outcome when OHLC event order is unknown; never assume a favorable order"
+  },
+  "period_boundary_policy": {
+    "warmup": "EXAMPLE: historical inputs before segment start may seed indicators but must be available at decision time",
+    "campaign_lifetime": "EXAMPLE: exclude a campaign unless entry through final exit and all outcome data remain inside the evaluation segment; forecast horizon alone is insufficient"
+  },
+  "notes": "EXAMPLE ONLY, not an executable trading specification. All IDs, dates 2000-2003, thresholds and placeholders are fictitious; no data availability or untouched status is claimed. Prior influence ID is illustrative and need not exist for Registry validation. A new ID does not reset a viewed final period. Real research must fully specify execution instrument, fees, spread/slippage, execution delay, position size, exit rules, full-capital return and drawdown before registration/run. Registry does not implement a trading engine or validate these financial assumptions."
+}

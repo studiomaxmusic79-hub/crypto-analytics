@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "experiment_id": "EXAMPLE-forecast-v1-not-a-real-experiment",
+  "study_family_id": "EXAMPLE-krypta-strategy-v1-like",
+  "influenced_by_experiment_ids": [],
+  "experiment_type": "FORECAST_RESEARCH",
+  "hypothesis": "EXAMPLE ONLY: a Strategy v1-like BTC/ETH directional candidate exceeds ALWAYS_UP accuracy at a prespecified coverage on the 1h horizon.",
+  "strategy_id": "EXAMPLE_KRYPTA_STRATEGY_V1_LIKE",
+  "strategy_version": "EXAMPLE_REPLACE_WITH_FROZEN_VERSION",
+  "code_commit_sha": "EXAMPLE_REPLACE_WITH_ACTUAL_COMMIT_SHA",
+  "config_hash": "EXAMPLE_REPLACE_WITH_ACTUAL_CONFIG_HASH",
+  "dataset_id": "EXAMPLE_REPLACE_WITH_FROZEN_DATASET_ID",
+  "dataset_hash": "EXAMPLE_REPLACE_WITH_ACTUAL_DATASET_HASH",
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "development_period": {"start": "2000-01-01", "end": "2001-01-01"},
+  "validation_period": {"start": "2001-01-01", "end": "2002-01-01"},
+  "final_test_period": {"start": "2002-01-01", "end": "2003-01-01"},
+  "evaluator_version": "EXAMPLE_REPLACE_WITH_PINNED_COMMON_EVALUATOR_COMMIT",
+  "benchmarks": ["ALWAYS_UP", "PREVIOUS_HOUR_MOMENTUM", "EMA20_50_1H"],
+  "primary_endpoint": "EXAMPLE_1h_accuracy_excess_pp_vs_ALWAYS_UP",
+  "secondary_endpoints": [
+    "EXAMPLE_1h_accuracy_excess_pp_vs_PREVIOUS_HOUR_MOMENTUM",
+    "EXAMPLE_1h_accuracy_excess_pp_vs_EMA20_50_1H",
+    "EXAMPLE_directional_accuracy_pct_by_symbol"
+  ],
+  "metrics": [
+    "directional_accuracy_pct",
+    "coverage_pct",
+    "accuracy_excess_pp",
+    "EXAMPLE_actual_UP_DOWN_FLAT_distribution",
+    "EXAMPLE_decision_UP_DOWN_WAIT_distribution",
+    "EXAMPLE_uncertainty_interval"
+  ],
+  "acceptance_criteria": {
+    "example_only": true,
+    "primary_min_accuracy_excess_pp_vs_ALWAYS_UP": 3.0,
+    "min_coverage_pct": 20.0,
+    "required_before_real_registration": [
+      "Replace illustrative thresholds with prespecified justified criteria",
+      "Define aggregation across symbols, comparison cohort and missing-data policy",
+      "Define uncertainty method and its acceptance rule accounting for temporal dependence"
+    ]
+  },
+  "evaluation_policy": {
+    "example_only": true,
+    "horizon_hours": 1,
+    "flat_threshold_pct": 0.2,
+    "warmup": "EXAMPLE: use only closed candles available before each decision; freeze the history window for candidate and benchmarks",
+    "boundary": "Exclude decisions whose outcome reaches or crosses the evaluation segment end",
+    "wait": "Not correct or incorrect; included in coverage denominator, excluded from directional accuracy denominator"
+  },
+  "notes": "EXAMPLE ONLY. All identities, placeholders, dates and thresholds are fictitious. Dates 2000-2003 are neutral demonstrations, not real test dates or claims of available/untouched data. Empty influence list illustrates a first family experiment only; disclose all actual prior influence before real registration. Registry validates structure, not evaluator metric support or research readiness."
+}
