@@ -10,6 +10,20 @@
 - Любое изменение hypothesis, parameters, periods или primary endpoint после просмотра результата означает новый эксперимент; влияние предыдущих экспериментов сохраняется в lineage. Уже зарегистрированный manifest не редактируется, в том числе самим backtest после запуска.
 - Все эксперименты, включая `FAILED` и `ABORTED`, сохраняются. Терминальный результат записывается через Registry с исходными `experiment_id` и `manifest_hash`; неудачи не удаляются ради отбора удачных результатов.
 
+## Canonical instrument identity
+
+`symbol` сам по себе не является полной instrument identity. Минимальный manifest-формат — `instrument_contexts`: список объектов с пятью непустыми строковыми полями `venue`, `market_type`, `base_asset`, `quote_asset`, `venue_symbol`. Identity определяется всей пятёркой, например `BINANCE / SPOT / ETH / USDT / ETHUSDT`, а не названием coin или одним symbol. Это декларация контекста эксперимента, не instrument catalog и не поддержка новых venues в runtime.
+
+- Immutable manifest сохраняет все пять полей. В примерах venue, market_type и asset codes записаны явно в uppercase; `venue_symbol` сохраняет обозначение конкретного venue. Нельзя автоматически выводить base/quote из symbol, удалять разделители или считать aliases разных venues эквивалентными.
+- Один и тот же symbol на другом venue означает другой instrument context. Binance Spot ETHUSDT и ETH/USDT другого venue не считаются автоматически одним dataset. Даже совпадение instrument context не заменяет `dataset_id`, `dataset_hash` и описание периода/источника данных.
+- `instrument_contexts` перечисляет используемые контексты; существующее `symbols` сохраняется для совместимости и не заменяет полную identity. Дополнительное `roles` помечает назначение (`ANALYTICS`, `EXECUTION`), но не входит в пятёрку instrument identity. Execution instrument фиксируется отдельно в `execution_assumptions.execution_instrument`, объектом из тех же пяти полей; он должен совпадать с контекстом роли `EXECUTION` в списке. Это явное описание ролей без каталога, surrogate IDs или механизма разрешения ссылок.
+- Analytics instrument и future execution instrument могут различаться. Если это понадобится, оба указываются явно вместе с ролью; совпадение coin не даёт права неявно использовать котировки/свечи одного контекста для исполнения в другом. В trading-примере BTC и ETH — analytics inputs, а execution — только ETH Spot.
+- Commission/spread/slippage, delay, sizing и exit assumptions относятся к явно указанному execution instrument context, не к абстрактному ETH и не ко всем инструментам сразу.
+
+Для **НОВЫХ серьёзных trading experiments** полный instrument context и разделение analytics/execution обязательны по исследовательскому процессу **до регистрации и запуска**. Для новых forecast experiments также следует фиксировать контексты источников данных, как в шаблоне.
+
+Registry v1 сохраняет эти дополнительные поля без изменения schema_version, включает их в canonical bytes/hash, но не валидирует их содержание или взаимные ссылки. Обязательность по процессу не является новой проверкой validator. Старые manifests без этих полей остаются валидны; их не переписывают и не дополняют задним числом. Изменение identity зарегистрированного эксперимента требует нового manifest/experiment_id с корректной lineage.
+
 ## Разделение периодов
 
 | Период | Назначение и последствия просмотра |

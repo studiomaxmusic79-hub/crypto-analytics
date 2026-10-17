@@ -12,6 +12,10 @@
   "dataset_id": "EXAMPLE_REPLACE_WITH_FROZEN_DATASET_ID",
   "dataset_hash": "EXAMPLE_REPLACE_WITH_ACTUAL_DATASET_HASH",
   "symbols": ["BTCUSDT", "ETHUSDT"],
+  "instrument_contexts": [
+    {"venue": "BINANCE", "market_type": "SPOT", "base_asset": "BTC", "quote_asset": "USDT", "venue_symbol": "BTCUSDT", "roles": ["ANALYTICS"]},
+    {"venue": "BINANCE", "market_type": "SPOT", "base_asset": "ETH", "quote_asset": "USDT", "venue_symbol": "ETHUSDT", "roles": ["ANALYTICS"]}
+  ],
   "development_period": {"start": "2000-01-01", "end": "2001-01-01"},
   "validation_period": {"start": "2001-01-01", "end": "2002-01-01"},
   "final_test_period": {"start": "2002-01-01", "end": "2003-01-01"},
